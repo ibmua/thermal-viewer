@@ -126,9 +126,8 @@ IRON_LUT = _build_iron_lut()
 def colorize(gray8: np.ndarray, idx: int) -> np.ndarray:
     name, cv_cm = CMAPS[idx]
     if name == "Iron":
-        bgr = np.empty((*gray8.shape, 3), np.uint8)
-        for k in range(3): bgr[...,k] = IRON_LUT[gray8,0,k]
-        return bgr
+        # IRON_LUT shape (256,1,3); fancy-index dim-0 → (..., 1, 3), squeeze dim -2
+        return IRON_LUT[gray8, 0]          # vectorised, no Python loop
     if name == "Gray": return cv2.cvtColor(gray8, cv2.COLOR_GRAY2BGR)
     return cv2.applyColorMap(gray8, cv_cm)
 
@@ -141,8 +140,11 @@ def cmap_color_at(v255: int) -> Tuple[int,int,int]:
 
 class MotionGatedNUC:
     """Scene-based LMS NUC — learns fixed noise pattern from scene motion."""
-    def __init__(self, mu=0.004, thresh=4.0, sigma=11):
+    def __init__(self, mu=0.004, thresh=4.0, sigma=2):
         self.mu, self.thresh, self.sigma = mu, thresh, sigma
+        # Pre-compute kernel size: 2*ceil(3σ)+1, must be odd
+        ks = int(2 * np.ceil(3 * sigma) + 1) | 1
+        self._ksize = (ks, ks)   # sigma=2 → 13×13 (vs sigma=11 → 67×67, 25× faster)
         self.O    : Optional[np.ndarray] = None
         self.prev : Optional[np.ndarray] = None
         self.updates = 0
@@ -155,7 +157,7 @@ class MotionGatedNUC:
         self._ensure()
         corrected = f32 - self.O
         if self.prev is not None and np.mean(np.abs(f32-self.prev)) > self.thresh:
-            desired = cv2.GaussianBlur(corrected,(0,0),self.sigma,
+            desired = cv2.GaussianBlur(corrected, self._ksize, self.sigma,
                                        borderType=cv2.BORDER_REFLECT)
             self.O  += self.mu * (corrected - desired)
             self.updates += 1
@@ -210,7 +212,12 @@ class FlatFieldNUC:
         if not self.enabled or self.correction is None: return f32
         out = f32 + self.correction
         if self.n_bad > 0:
-            m = cv2.medianBlur(out, 3); out[self.bad_mask] = m[self.bad_mask]
+            # Replace each dead/stuck pixel with the average of its 3×3 neighbours.
+            # cv2.blur() computes a box-filter mean; applying it to the whole image
+            # is fast, and we only copy the result at bad-pixel locations so good
+            # pixels are never affected.
+            neighbour_mean = cv2.blur(out, (3, 3))
+            out[self.bad_mask] = neighbour_mean[self.bad_mask]
         return out
 
     def nuc_map_image(self, ci: int) -> np.ndarray:
@@ -293,10 +300,13 @@ class VideoRecorder:
 # ── Threaded grabber ──────────────────────────────────────────────────────────
 
 class FrameGrabber:
-    """Reads camera on a background thread — UI loop never blocks on cap.read()."""
+    """Reads camera on a background thread — UI loop never blocks on cap.read().
+    Tracks a 'new' flag so the main loop only processes each camera frame once,
+    giving accurate FPS measurement and no wasted NUC computation on duplicates."""
     def __init__(self, cap):
         self._cap   = cap
         self._frame : Optional[np.ndarray] = None
+        self._new   = False
         self._lock  = threading.Lock()
         self._alive = True
         threading.Thread(target=self._loop, daemon=True).start()
@@ -305,11 +315,15 @@ class FrameGrabber:
         while self._alive:
             ret, f = self._cap.read()
             if ret and f is not None:
-                with self._lock: self._frame = f
+                with self._lock:
+                    self._frame = f
+                    self._new   = True
 
     def read(self) -> Tuple[bool, Optional[np.ndarray]]:
+        """Returns (True, frame) only when a NEW frame has arrived since last call."""
         with self._lock:
-            if self._frame is None: return False, None
+            if not self._new or self._frame is None: return False, None
+            self._new = False
             return True, self._frame   # caller must not modify in-place
 
     def release(self):
@@ -404,8 +418,10 @@ def mouse_cb(event, x, y, flags, _):
 # ── Drawing helpers ───────────────────────────────────────────────────────────
 
 def put(img, text, x, y, color=C_BRIGHT, scale=0.40, bold=False):
+    # bold=True kept as parameter for API compat but always renders at weight 1
+    # (HERSHEY at small sizes looks better thin; bold at ≤0.5 scale is unreadable)
     cv2.putText(img, text, (x,y), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, color, 2 if bold else 1, cv2.LINE_AA)
+                scale, color, 1, cv2.LINE_AA)
 
 def card(sb, x, y, w, h, fill=BG_CARD, border=BORDER):
     cv2.rectangle(sb,(x,y),(x+w,y+h), fill,-1)
@@ -446,12 +462,15 @@ def draw_histogram(sb, x, y, w, h_px):
     if norm8 is None: return
     hist = cv2.calcHist([norm8],[0],None,[w],[0,256]).flatten()
     if hist.max() == 0: return
-    hn = (hist/hist.max() * (h_px-3)).astype(int)
-    for i in range(w):
-        bh = hn[i]
-        if bh > 0:
-            col = cmap_color_at(int(i/w*255))
-            cv2.line(sb,(x+i,y+h_px-1),(x+i,y+h_px-1-bh), col, 1)
+    bar_h = (hist / hist.max() * (h_px - 3)).astype(np.int32)   # shape (w,)
+
+    # Build a full-size colored strip then mask above each bar — fully vectorised
+    bar1d   = np.linspace(0, 255, w, dtype=np.uint8).reshape(1, -1)
+    colored = cv2.resize(colorize(bar1d, cm_idx), (w, h_px))     # (h_px, w, 3)
+    row_idx = np.arange(h_px, dtype=np.int32).reshape(-1, 1)     # (h_px, 1)
+    mask    = row_idx < (h_px - bar_h).reshape(1, -1)            # (h_px, w)
+    colored[mask] = (15, 15, 15)
+    sb[y:y+h_px, x:x+w] = colored
 
 # ── Main sidebar ──────────────────────────────────────────────────────────────
 
@@ -760,7 +779,7 @@ def main():
             if flatf.calibrating:
                 done = flatf.feed(f32)
                 if done:
-                    nuc_auto_t = now + 8.0
+                    nuc_auto_t = now + 1.0   # show NUC map for 1 second then return to Live
                     _action_set_view(1)
                     status_msg = (f"Flat-field done — {flatf.n_bad} bad px "
                                   f"— showing NUC Map")
