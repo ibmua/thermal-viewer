@@ -39,15 +39,15 @@ SENSOR_PROFILES: List[SensorProfile] = [
     SensorProfile("FLIR Lepton 3.x",       160, 120,  9, "PureThermal USB board"),
     SensorProfile("InfiRay / Xinfrared",   256, 192, 25, "USB-C thermal camera"),
     SensorProfile("Seek Compact",          320, 240, 15, "USB Seek Thermal"),
-    SensorProfile("Generic UVC 640×480",   640, 480, 30, ""),
-    SensorProfile("Generic UVC 320×240",   320, 240, 30, ""),
+    SensorProfile("Generic UVC 640x480",   640, 480, 30, ""),
+    SensorProfile("Generic UVC 320x240",   320, 240, 30, ""),
 ]
 
 def match_sensor(w: int, h: int) -> SensorProfile:
     for s in SENSOR_PROFILES:
         if s.w == w and s.h == h:
             return s
-    return SensorProfile(f"Unknown {w}×{h}", w, h, 30, "")
+    return SensorProfile(f"Unknown {w}x{h}", w, h, 30, "")
 
 # ── Layout (computed after sensor detection) ──────────────────────────────────
 TARGET_IW = 960     # target display width for camera image
@@ -585,9 +585,9 @@ def draw_sidebar(fps: float) -> np.ndarray:
     sname = sensor.name if sensor else "Thermal Camera"
     put(sb, sname, X, 15, C_BRIGHT, 0.44)
     fps_col = C_ACCENT if fps >= 55 else C_BLUE if fps >= 25 else C_RED
-    line2 = f"{fps:.0f} fps  ·  {CAM_W}×{CAM_H}"
-    if frozen:             line2 += "  ● FROZEN";         fps_col = C_FROST
-    if recorder.recording: line2 += f"  ● REC {recorder.elapsed:.0f}s"; fps_col = C_REC
+    line2 = f"{fps:.0f} fps  {CAM_W}x{CAM_H}"
+    if frozen:             line2 += "  [FROZEN]";               fps_col = C_FROST
+    if recorder.recording: line2 += f"  [REC] {recorder.elapsed:.0f}s"; fps_col = C_REC
     put(sb, line2, X, 33, fps_col, 0.35)
     y = 52
 
@@ -597,7 +597,8 @@ def draw_sidebar(fps: float) -> np.ndarray:
     _gap = 3
     bw3  = (BW - _gap * 2) // 3    # ≈82 px each
 
-    def _abtn(bi, label, active, hi_col, fn):
+    def _abtn(bi, label, active, hi_col, fn, dot=None):
+        """dot: None | 'circle' | 'square' — draws a coloured shape before the label."""
         bx  = X + bi * (bw3 + _gap)
         hov = hovering(bx, y, bw3, ABH)
         if active:
@@ -609,14 +610,25 @@ def draw_sidebar(fps: float) -> np.ndarray:
             bg, tc, bc = (22, 22, 22), C_DIM, BORDER
         cv2.rectangle(sb, (bx, y), (bx+bw3, y+ABH), bg, -1)
         cv2.rectangle(sb, (bx, y), (bx+bw3, y+ABH), bc,  1)
-        tw = len(label) * 7
-        tx = bx + max(4, (bw3 - tw) // 2)
-        put(sb, label, tx, y + ABH//2 + 6, tc, 0.35)
+        dot_w = 12 if dot else 0
+        tw    = len(label) * 7 + dot_w
+        tx    = bx + max(4, (bw3 - tw) // 2)
+        text_y = y + ABH//2 + 6
+        if dot:
+            dot_col = hi_col if (active or hov) else (65, 65, 65)
+            dcx, dcy = tx + 4, text_y - 5
+            if dot == 'circle':
+                cv2.circle(sb, (dcx, dcy), 4, dot_col, -1, cv2.LINE_AA)
+            else:   # square
+                cv2.rectangle(sb, (dcx-4, dcy-4), (dcx+4, dcy+4), dot_col, -1)
+            tx += 12
+        put(sb, label, tx, text_y, tc, 0.35)
         reg_hb(bx, y, bw3, ABH, fn)
 
     _abtn(0, "FREEZE", frozen, C_FROST, _action_freeze)
-    _abtn(1, "■ STOP" if recorder.recording else "● REC",
-          recorder.recording, C_REC, _action_toggle_record)
+    _abtn(1, "STOP" if recorder.recording else "REC",
+          recorder.recording, C_REC, _action_toggle_record,
+          dot='square' if recorder.recording else 'circle')
     _abtn(2, "SAVE", False, C_ACCENT, _action_save_snapshot)
 
     y += ABH + 8
@@ -636,7 +648,7 @@ def draw_sidebar(fps: float) -> np.ndarray:
         mn, mx, me, dl = (frame_stats["min"], frame_stats["max"],
                           frame_stats["mean"], frame_stats["delta"])
         card(sb, X, y, BW, 28, fill=(19, 19, 19))
-        put(sb, f"Min {mn:.0f}%   Max {mx:.0f}%   Δ {dl:.0f}%",
+        put(sb, f"Min {mn:.0f}%  Max {mx:.0f}%  dT {dl:.0f}%",
             X+5, y+13, C_MED, 0.32)
         put(sb, f"Mean {me:.0f}%", X+5, y+24, C_DIM, 0.29)
         y += 32
@@ -686,7 +698,7 @@ def draw_sidebar(fps: float) -> np.ndarray:
     y = section(sb, X, y, "FLAT-FIELD NUC  (F)", calib_col)
 
     if flatf.calibrating:
-        put(sb, "CAPTURING — hold still", X, y, C_ORANGE, 0.36); y += 16
+        put(sb, "CAPTURING - hold still", X, y, C_ORANGE, 0.36); y += 16
         pw = BW
         cv2.rectangle(sb, (X, y), (X+pw,              y+14), (26, 26, 26), -1)
         cv2.rectangle(sb, (X, y), (X+int(pw*flatf.progress), y+14), (0,160,55), -1)
@@ -697,16 +709,17 @@ def draw_sidebar(fps: float) -> np.ndarray:
         y += 14
     elif flatf.enabled:
         card(sb, X, y, BW, 38, fill=(18, 24, 18))
-        put(sb, "● Calibrated",                      X+6, y+14, C_GREEN, 0.36)
-        put(sb, f"{flatf.n_bad} bad pixels corrected", X+6, y+27, C_DIM,   0.29)
+        cv2.circle(sb, (X+8, y+10), 4, C_GREEN, -1, cv2.LINE_AA)
+        put(sb, "Calibrated",                          X+18, y+14, C_GREEN, 0.36)
+        put(sb, f"{flatf.n_bad} bad pixels corrected", X+6,  y+27, C_DIM,   0.29)
         y += 42
-        put(sb, "N → NUC Map  |  F = recalibrate", X, y, C_DIM, 0.28)
+        put(sb, "N > NUC Map  |  F = recalibrate", X, y, C_DIM, 0.28)
         y += 14
     else:
         card(sb, X, y, BW, 52, fill=(20, 18, 18))
         put(sb, "Not calibrated",                X+6, y+13, C_DIM,    0.34)
         put(sb, "1. Point at blank wall or sky",  X+6, y+27, C_MED,    0.30)
-        put(sb, "2. Press F — hold 2 seconds",    X+6, y+40, C_ORANGE, 0.32)
+        put(sb, "2. Press F - hold 2 seconds",     X+6, y+40, C_ORANGE, 0.32)
         y += 56
 
     # ── Corrections ───────────────────────────────────────────────────────────
@@ -725,7 +738,7 @@ def draw_sidebar(fps: float) -> np.ndarray:
         put(sb, "Right-click to remove nearest",  X, y, C_DIM, 0.30)
     else:
         for i, m in enumerate(markers):
-            val   = f"{norm8[m['y'], m['x']] / 255 * 100:.0f}%" if norm8 is not None else "—"
+            val   = f"{norm8[m['y'], m['x']] / 255 * 100:.0f}%" if norm8 is not None else "-"
             hov_m = hovering(X, y, BW, 22)
             if hov_m:
                 cv2.rectangle(sb, (X, y), (X+BW, y+22), (30, 30, 30), -1)
@@ -745,7 +758,7 @@ def draw_sidebar(fps: float) -> np.ndarray:
     bot = IH - 44
     hline(sb, bot)
     put(sb, "S = snapshot    Q / Esc = quit",         X, bot+15, C_DIM, 0.31)
-    put(sb, "Recordings → ~/Desktop/BosonCaptures/",  X, bot+29, C_DIM, 0.27)
+    put(sb, "Recordings > ~/Desktop/BosonCaptures/",  X, bot+29, C_DIM, 0.27)
 
     return sb
 
@@ -754,12 +767,12 @@ def draw_sidebar(fps: float) -> np.ndarray:
 def _action_cycle_cmap():
     global cm_idx, status_msg
     cm_idx = (cm_idx+1) % len(CMAPS)
-    status_msg = f"Colormap → {CMAPS[cm_idx][0]}"
+    status_msg = f"Colormap: {CMAPS[cm_idx][0]}"
 
 def _action_set_view(v: int):
     global view_mode, nuc_auto_t, status_msg
     nuc_auto_t = 0.0; view_mode = v
-    status_msg = f"View → {VIEW_MODES[v]}"
+    status_msg = f"View: {VIEW_MODES[v]}"
 
 def _action_toggle_denoise():
     global denoise, status_msg
@@ -785,22 +798,22 @@ def _action_toggle_record():
     global status_msg
     if recorder.recording:
         path, n, dur = recorder.stop()
-        status_msg = f"Saved {n} frames ({dur:.1f}s) → {os.path.basename(path)}"
+        status_msg = f"Saved {n} frames ({dur:.1f}s)  {os.path.basename(path)}"
     else:
         recorder.start(IW, IH, fps_current)
-        status_msg = f"Recording started → {os.path.basename(recorder.path)}"
+        status_msg = f"Recording: {os.path.basename(recorder.path)}"
 
 def _action_freeze():
     global frozen, status_msg
     frozen = not frozen
-    status_msg = "Frame frozen — SPACE to resume" if frozen else "Resumed"
+    status_msg = "Frame frozen - SPACE to resume" if frozen else "Resumed"
 
 def _action_start_calibrate():
     global status_msg
     if not flatf.calibrating:
         flatf.start(); nuc.reset()
         _action_set_view(0)
-        status_msg = "Flat-field calibration started — aim at uniform surface"
+        status_msg = "Flat-field calibration started - aim at uniform surface"
 
 def _action_save_snapshot():
     global status_msg
@@ -810,7 +823,7 @@ def _action_save_snapshot():
     fn = os.path.join(d, f"thermal_{ts}.png")
     if _canvas is not None:
         cv2.imwrite(fn, _canvas)
-        status_msg = f"Saved → {os.path.basename(fn)}"
+        status_msg = f"Saved: {os.path.basename(fn)}"
 
 # ── Camera image builder ──────────────────────────────────────────────────────
 
@@ -902,8 +915,8 @@ def main():
                 if done:
                     nuc_auto_t = now + 1.0   # show NUC map for 1 second then return to Live
                     _action_set_view(1)
-                    status_msg = (f"Flat-field done — {flatf.n_bad} bad px "
-                                  f"— showing NUC Map")
+                    status_msg = (f"Flat-field done - {flatf.n_bad} bad px "
+                                  f"- showing NUC Map")
 
             if denoise:
                 f32 = flatf.apply(f32)
@@ -927,7 +940,7 @@ def main():
         # Auto-revert NUC map view
         if view_mode==1 and nuc_auto_t>0 and now>nuc_auto_t:
             view_mode=0; nuc_auto_t=0.0
-            status_msg = "Returned to Live view — N to see NUC Map again"
+            status_msg = "Returned to Live view - N to see NUC Map again"
 
         # FPS counter
         if now - fps_t >= 1.0:
@@ -981,13 +994,14 @@ def main():
         vm_col = {0:C_DIM, 1:C_ORANGE, 2:C_DIM}[view_mode]
         put(_canvas, f"[{VIEW_MODES[view_mode].upper()}]", 8, IH+21, vm_col, 0.36)
         if frozen:
-            put(_canvas, "FROZEN — SPACE to resume", 80, IH+21, C_FROST, 0.38)
+            put(_canvas, "FROZEN - SPACE to resume", 80, IH+21, C_FROST, 0.38)
         elif flatf.calibrating:
             put(_canvas, f"Calibrating  {int(flatf.progress*100)}%  "
-                        f"({flatf.frames_captured}/{flatf.N}) — hold still",
+                        f"({flatf.frames_captured}/{flatf.N}) - hold still",
                80, IH+21, C_ORANGE, 0.38)
         elif recorder.recording:
-            put(_canvas, f"● RECORDING  {recorder.elapsed:.0f}s", 80, IH+21, C_REC, 0.38)
+            cv2.rectangle(_canvas, (82, IH+12), (90, IH+20), C_REC, -1)
+            put(_canvas, f"RECORDING  {recorder.elapsed:.0f}s", 96, IH+21, C_REC, 0.38)
         else:
             put(_canvas, status_msg, 80, IH+21, (148,148,148), 0.36)
 
@@ -1011,7 +1025,7 @@ def main():
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             fn = os.path.join(d, f"thermal_{ts}.png")
             cv2.imwrite(fn, _canvas)
-            status_msg = f"Saved → {os.path.basename(fn)}"
+            status_msg = f"Saved: {os.path.basename(fn)}"
 
     if recorder.recording: recorder.stop()
     grabber.release()
