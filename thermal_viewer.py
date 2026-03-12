@@ -1048,9 +1048,15 @@ def main():
         cv2.imshow(WIN_NAME, _canvas)
         _prof_tick(3)    # slot 3: imshow
 
-        # pollKey() is non-blocking (no VSync sleep); falls back to waitKey(1)
-        # once every ~100 ms to keep the macOS event loop alive for window events.
-        key = cv2.pollKey() & 0xFF
+        # On macOS, pollKey() still syncs to the 60Hz VSync barrier (~14ms).
+        # Calling it every 6 frames amortises that cost to ~2ms/frame, letting
+        # the loop run faster than camera delivery and match 60fps.
+        # imshow() renders through Core Animation asynchronously, so every
+        # frame pushed to it appears at the next VSync regardless of pollKey.
+        if _sb_tick % 6 == 0:
+            key = cv2.pollKey() & 0xFF
+        else:
+            key = 0xFF
         _prof_tick(4)    # slot 4: key poll
 
         # ── Profiler output every 2 s ─────────────────────────────────────
