@@ -531,25 +531,31 @@ def section(sb, x, y, title, color=C_ACCENT) -> int:
 
 def toggle_row(sb, x, y, label, shortcut, on: bool, action,
                on_color=None, off_label="OFF") -> int:
-    """Draw a toggleable row with badge + label + keyboard hint. Returns new y."""
+    """Draw a full-width toggleable row (26 px tall). Returns new y."""
     on_col = on_color or C_GREEN
-    hover  = hovering(x, y-14, SB_W-x-4, 18)
-    row_bg = (32,32,32) if hover else BG
-    cv2.rectangle(sb,(x-2,y-14),(SB_W-4,y+4), row_bg,-1)
+    ROW_H  = 26
+    hover  = hovering(x, y, SB_W - x - 4, ROW_H)
+    row_bg = (36, 36, 36) if hover else (22, 22, 22)
+    cv2.rectangle(sb, (x,    y), (SB_W-4, y+ROW_H), row_bg, -1)
+    cv2.rectangle(sb, (x,    y), (SB_W-4, y+ROW_H),
+                  BORDER_HI if hover else BORDER, 1)
 
     # Badge
-    bc = on_col if on else (38,38,38)
-    if hover: bc = tuple(min(255,c+25) for c in bc)
-    tc = (255,255,255) if on else (65,65,65)
-    cv2.rectangle(sb,(x,y-12),(x+34,y+4), bc,-1)
-    cv2.rectangle(sb,(x,y-12),(x+34,y+4), BORDER_HI if hover else BORDER, 1)
-    put(sb, "ON" if on else off_label, x+4, y, tc, 0.29)
+    bc = on_col if on else (36, 36, 36)
+    if hover: bc = tuple(min(255, c+22) for c in bc)
+    tc_b = (255, 255, 255) if on else (62, 62, 62)
+    bx1, by1, bx2, by2 = x+4, y+5, x+38, y+21
+    cv2.rectangle(sb, (bx1, by1), (bx2, by2), bc, -1)
+    cv2.rectangle(sb, (bx1, by1), (bx2, by2),
+                  BORDER_HI if hover else BORDER, 1)
+    put(sb, "ON" if on else off_label, bx1+4, by2-3, tc_b, 0.29)
 
-    put(sb, label, x+40, y, C_BRIGHT if on else C_DIM, 0.36)
-    put(sb, f"({shortcut})", SB_W-28, y, C_DIM, 0.28)
+    tx_y = y + ROW_H - 7
+    put(sb, label,           x+44,     tx_y, C_BRIGHT if on else C_DIM, 0.35)
+    put(sb, f"({shortcut})", SB_W-30,  tx_y, C_DIM, 0.28)
 
-    reg_hb(x-2, y-14, SB_W-x-2, 18, action)
-    return y + 20
+    reg_hb(x, y, SB_W - x - 4, ROW_H, action)
+    return y + ROW_H + 2
 
 def draw_histogram(sb, x, y, w, h_px):
     card(sb, x, y, w, h_px, fill=(15,15,15))
@@ -571,161 +577,175 @@ def draw_sidebar(fps: float) -> np.ndarray:
     global status_msg
     _hitboxes.clear()
     sb = np.full((IH, SB_W, 3), BG, dtype=np.uint8)
-    X = 8
+    X  = 8
+    BW = SB_W - 16   # standard card / button width
 
     # ── Header ────────────────────────────────────────────────────────────────
-    card(sb, 0, 0, SB_W, 56, fill=(18,18,18))
+    card(sb, 0, 0, SB_W, 48, fill=(18, 18, 18))
     sname = sensor.name if sensor else "Thermal Camera"
-    put(sb, sname, X, 16, C_BRIGHT, 0.46, bold=True)
-    fps_col = C_ACCENT if fps>=55 else C_BLUE if fps>=25 else C_RED
-    line2 = f"{fps:.0f} fps    {CAM_W}×{CAM_H}"
-    if frozen:     line2 += "  ● FROZEN";   fps_col = C_FROST
-    if recorder.recording:
-        t = recorder.elapsed
-        line2 += f"  ● REC {t:.0f}s"; fps_col = C_REC
-    put(sb, line2, X, 38, fps_col, 0.37)
-    y = 64
+    put(sb, sname, X, 15, C_BRIGHT, 0.44)
+    fps_col = C_ACCENT if fps >= 55 else C_BLUE if fps >= 25 else C_RED
+    line2 = f"{fps:.0f} fps  ·  {CAM_W}×{CAM_H}"
+    if frozen:             line2 += "  ● FROZEN";         fps_col = C_FROST
+    if recorder.recording: line2 += f"  ● REC {recorder.elapsed:.0f}s"; fps_col = C_REC
+    put(sb, line2, X, 33, fps_col, 0.35)
+    y = 52
+
+    # ── Three large action buttons: FREEZE / REC·STOP / SAVE ──────────────────
+    hline(sb, y); y += 6
+    ABH  = 34                       # action button height
+    _gap = 3
+    bw3  = (BW - _gap * 2) // 3    # ≈82 px each
+
+    def _abtn(bi, label, active, hi_col, fn):
+        bx  = X + bi * (bw3 + _gap)
+        hov = hovering(bx, y, bw3, ABH)
+        if active:
+            bg = tuple(int(c * 0.45) for c in hi_col)
+            tc, bc = hi_col, hi_col
+        elif hov:
+            bg, tc, bc = (44, 44, 44), C_BRIGHT, BORDER_HI
+        else:
+            bg, tc, bc = (22, 22, 22), C_DIM, BORDER
+        cv2.rectangle(sb, (bx, y), (bx+bw3, y+ABH), bg, -1)
+        cv2.rectangle(sb, (bx, y), (bx+bw3, y+ABH), bc,  1)
+        tw = len(label) * 7
+        tx = bx + max(4, (bw3 - tw) // 2)
+        put(sb, label, tx, y + ABH//2 + 6, tc, 0.35)
+        reg_hb(bx, y, bw3, ABH, fn)
+
+    _abtn(0, "FREEZE", frozen, C_FROST, _action_freeze)
+    _abtn(1, "■ STOP" if recorder.recording else "● REC",
+          recorder.recording, C_REC, _action_toggle_record)
+    _abtn(2, "SAVE", False, C_ACCENT, _action_save_snapshot)
+
+    y += ABH + 8
+    hline(sb, y); y += 8
 
     # ── Histogram ─────────────────────────────────────────────────────────────
-    hline(sb, y); y += 10
     y = section(sb, X, y, "THERMAL DISTRIBUTION")
-    HW, HH = SB_W-16, 58
+    HW, HH = BW, 52
     draw_histogram(sb, X, y, HW, HH)
     y += HH + 3
-    put(sb, "Cold", X, y, C_DIM, 0.29)
-    put(sb, "Hot",  SB_W-30, y, C_DIM, 0.29)
+    put(sb, "Cold", X,       y, C_DIM, 0.29)
+    put(sb, "Hot",  X+BW-22, y, C_DIM, 0.29)
     y += 13
 
     # ── Frame stats ───────────────────────────────────────────────────────────
     if frame_stats["delta"] > 0:
-        mn,mx,me,dl = (frame_stats["min"],frame_stats["max"],
-                       frame_stats["mean"],frame_stats["delta"])
-        card(sb, X, y, SB_W-16, 28, fill=(19,19,19))
+        mn, mx, me, dl = (frame_stats["min"], frame_stats["max"],
+                          frame_stats["mean"], frame_stats["delta"])
+        card(sb, X, y, BW, 28, fill=(19, 19, 19))
         put(sb, f"Min {mn:.0f}%   Max {mx:.0f}%   Δ {dl:.0f}%",
             X+5, y+13, C_MED, 0.32)
         put(sb, f"Mean {me:.0f}%", X+5, y+24, C_DIM, 0.29)
         y += 32
 
     # ── Colormap ──────────────────────────────────────────────────────────────
-    hline(sb, y); y += 10
+    hline(sb, y); y += 8
     y = section(sb, X, y, "COLORMAP")
-    hov_cm = hovering(X, y, SB_W-16, 14)
-    sb[y:y+14, X:X+SB_W-16] = _cmap_strip(SB_W-16, 14)   # cached
-    cv2.rectangle(sb,(X,y),(X+SB_W-16,y+14), BORDER_HI if hov_cm else BORDER, 1)
-    reg_hb(X, y, SB_W-16, 14, lambda: _action_cycle_cmap())
-    y += 18
-    put(sb, CMAPS[cm_idx][0], X, y, C_BRIGHT, 0.40, bold=True)
-    put(sb, "click or C", SB_W-72, y, C_DIM, 0.30)
+    hov_cm = hovering(X, y, BW, 18)
+    sb[y:y+18, X:X+BW] = _cmap_strip(BW, 18)
+    cv2.rectangle(sb, (X, y), (X+BW, y+18),
+                  BORDER_HI if hov_cm else BORDER, 1)
+    reg_hb(X, y, BW, 18, _action_cycle_cmap)
+    y += 22
+    put(sb, CMAPS[cm_idx][0], X,       y, C_BRIGHT, 0.40)
+    put(sb, "click or C",     X+BW-64, y, C_DIM,    0.30)
     y += 14
 
     # ── View mode tabs ────────────────────────────────────────────────────────
-    hline(sb, y); y += 10
+    hline(sb, y); y += 8
     y = section(sb, X, y, "VIEW MODE")
-    tab_w = (SB_W-16) // 3
+    tab_w = BW // 3
+    tab_h = 24
     for vi, vname in enumerate(VIEW_MODES):
-        bx = X + vi*tab_w
+        bx      = X + vi * tab_w
         active  = (vi == view_mode)
-        hov_tab = hovering(bx, y-12, tab_w-2, 18)
-        bg  = (52,100,152) if active else ((35,35,35) if hov_tab else (26,26,26))
-        tc  = (255,255,255) if active else ((180,180,180) if hov_tab else (65,65,65))
-        cv2.rectangle(sb,(bx,y-12),(bx+tab_w-2,y+5), bg,-1)
-        cv2.rectangle(sb,(bx,y-12),(bx+tab_w-2,y+5), BORDER_HI if hov_tab else BORDER, 1)
-        put(sb, vname, bx+4, y, tc, 0.30, bold=active)
-        vi_cap = vi   # capture for lambda
-        reg_hb(bx, y-12, tab_w-2, 17, lambda v=vi_cap: _action_set_view(v))
-    y += 8
-    desc = {0:"Corrected live feed",
-            1:"Flat-field noise map" if flatf.correction is not None else "No calibration yet",
-            2:"Raw uncorrected feed"}[view_mode]
-    dc = C_ORANGE if (view_mode==1 and flatf.correction is None) else C_DIM
+        hov_tab = hovering(bx, y, tab_w - 2, tab_h)
+        bg  = (52, 100, 152) if active else ((38, 38, 38) if hov_tab else (26, 26, 26))
+        tc  = (255,255,255) if active else ((190,190,190) if hov_tab else (70, 70, 70))
+        cv2.rectangle(sb, (bx, y), (bx+tab_w-2, y+tab_h), bg, -1)
+        cv2.rectangle(sb, (bx, y), (bx+tab_w-2, y+tab_h),
+                      BORDER_HI if hov_tab else BORDER, 1)
+        tw = len(vname) * 6
+        tx = bx + max(3, (tab_w - tw) // 2)
+        put(sb, vname, tx, y+tab_h-7, tc, 0.30)
+        reg_hb(bx, y, tab_w-2, tab_h, lambda v=vi: _action_set_view(v))
+    y += tab_h + 4
+    desc = {0: "Corrected live feed",
+            1: "Flat-field noise map" if flatf.correction is not None else "No calibration yet",
+            2: "Raw uncorrected feed"}[view_mode]
+    dc = C_ORANGE if (view_mode == 1 and flatf.correction is None) else C_DIM
     put(sb, desc, X, y, dc, 0.29)
     y += 14
 
     # ── Flat-field NUC ────────────────────────────────────────────────────────
-    hline(sb, y); y += 10
+    hline(sb, y); y += 8
     calib_col = C_ORANGE if flatf.calibrating else (C_GREEN if flatf.enabled else C_RED)
     y = section(sb, X, y, "FLAT-FIELD NUC  (F)", calib_col)
 
     if flatf.calibrating:
-        put(sb, "CAPTURING — hold still", X, y, C_ORANGE, 0.36, bold=True); y += 16
-        pw = SB_W-16
-        cv2.rectangle(sb,(X,y),(X+pw,y+14),(26,26,26),-1)
-        cv2.rectangle(sb,(X,y),(X+int(pw*flatf.progress),y+14),(0,160,55),-1)
-        cv2.rectangle(sb,(X,y),(X+pw,y+14),BORDER,1)
+        put(sb, "CAPTURING — hold still", X, y, C_ORANGE, 0.36); y += 16
+        pw = BW
+        cv2.rectangle(sb, (X, y), (X+pw,              y+14), (26, 26, 26), -1)
+        cv2.rectangle(sb, (X, y), (X+int(pw*flatf.progress), y+14), (0,160,55), -1)
+        cv2.rectangle(sb, (X, y), (X+pw,              y+14), BORDER, 1)
         put(sb, f"{flatf.frames_captured}/{flatf.N}", X+pw//2-16, y+11, C_BRIGHT, 0.32)
         y += 20
         put(sb, "Point at wall / sky / lens cap", X, y, C_DIM, 0.30)
         y += 14
     elif flatf.enabled:
-        card(sb, X, y, SB_W-16, 38, fill=(18,24,18))
-        put(sb, "● Calibrated", X+6, y+14, C_GREEN, 0.36, bold=True)
-        put(sb, f"{flatf.n_bad} bad pixels corrected", X+6, y+27, C_DIM, 0.29)
+        card(sb, X, y, BW, 38, fill=(18, 24, 18))
+        put(sb, "● Calibrated",                      X+6, y+14, C_GREEN, 0.36)
+        put(sb, f"{flatf.n_bad} bad pixels corrected", X+6, y+27, C_DIM,   0.29)
         y += 42
-        put(sb, "N → NUC Map view  |  F = recalibrate", X, y, C_DIM, 0.28)
+        put(sb, "N → NUC Map  |  F = recalibrate", X, y, C_DIM, 0.28)
         y += 14
     else:
-        card(sb, X, y, SB_W-16, 52, fill=(20,18,18))
-        put(sb, "Not calibrated", X+6, y+13, C_DIM, 0.34)
-        put(sb, "1. Point at blank wall or sky", X+6, y+27, C_MED, 0.30)
-        put(sb, "2. Press F — hold 2 seconds", X+6, y+40, C_ORANGE, 0.32, bold=True)
+        card(sb, X, y, BW, 52, fill=(20, 18, 18))
+        put(sb, "Not calibrated",                X+6, y+13, C_DIM,    0.34)
+        put(sb, "1. Point at blank wall or sky",  X+6, y+27, C_MED,    0.30)
+        put(sb, "2. Press F — hold 2 seconds",    X+6, y+40, C_ORANGE, 0.32)
         y += 56
 
     # ── Corrections ───────────────────────────────────────────────────────────
-    hline(sb, y); y += 10
+    hline(sb, y); y += 8
     y = section(sb, X, y, "CORRECTIONS")
-    y = toggle_row(sb, X, y, "Motion NUC",       "D", denoise,          _action_toggle_denoise)
-    y = toggle_row(sb, X, y, "Temporal smooth",   "T", smoother.enabled, _action_toggle_temporal)
-    y = toggle_row(sb, X, y, "Flip horizontal",   "H", flip_h,           _action_toggle_fliph, C_BLUE, "OFF")
-    y = toggle_row(sb, X, y, "Flip vertical",     "V", flip_v,           _action_toggle_flipv, C_BLUE, "OFF")
-    y += 2
-
-    # ── Recording ─────────────────────────────────────────────────────────────
-    hline(sb, y); y += 10
-    rec_col = C_REC if recorder.recording else C_DIM
-    y = section(sb, X, y, "RECORDING  (R)", rec_col)
-    if recorder.recording:
-        dur = recorder.elapsed
-        card(sb, X, y, SB_W-16, 28, fill=(22,14,14))
-        put(sb, f"● REC  {dur:.0f}s", X+6, y+13, C_REC, 0.38, bold=True)
-        put(sb, "R or click to stop", X+6, y+25, C_DIM, 0.28)
-        y += 32
-    else:
-        hov_r = hovering(X, y, SB_W-16, 22)
-        rc = (30,25,25) if hov_r else (20,20,20)
-        card(sb, X, y, SB_W-16, 22, fill=rc)
-        put(sb, "Click or R to start recording", X+6, y+14, C_DIM if not hov_r else C_MED, 0.30)
-        reg_hb(X, y, SB_W-16, 22, _action_toggle_record)
-        y += 26
+    y = toggle_row(sb, X, y, "Motion NUC",      "D", denoise,          _action_toggle_denoise)
+    y = toggle_row(sb, X, y, "Temporal smooth",  "T", smoother.enabled, _action_toggle_temporal)
+    y = toggle_row(sb, X, y, "Flip horizontal",  "H", flip_h,           _action_toggle_fliph,  C_BLUE, "OFF")
+    y = toggle_row(sb, X, y, "Flip vertical",    "V", flip_v,           _action_toggle_flipv,  C_BLUE, "OFF")
 
     # ── Markers ───────────────────────────────────────────────────────────────
-    hline(sb, y); y += 10
+    hline(sb, y); y += 8
     y = section(sb, X, y, f"MARKERS  ({len(markers)} placed)")
     if not markers:
-        put(sb, "Click image to place a marker", X, y, C_DIM, 0.30); y+=14
-        put(sb, "Right-click to remove nearest", X, y, C_DIM, 0.30)
+        put(sb, "Click image to place a marker",  X, y, C_DIM, 0.30); y += 14
+        put(sb, "Right-click to remove nearest",  X, y, C_DIM, 0.30)
     else:
         for i, m in enumerate(markers):
-            val = f"{norm8[m['y'],m['x']]/255*100:.0f}%" if norm8 is not None else "—"
-            hov_m = hovering(X, y-12, SB_W-16, 18)
+            val   = f"{norm8[m['y'], m['x']] / 255 * 100:.0f}%" if norm8 is not None else "—"
+            hov_m = hovering(X, y, BW, 22)
             if hov_m:
-                cv2.rectangle(sb,(X,y-12),(SB_W-8,y+5),(28,28,28),-1)
-            cv2.circle(sb,(X+7,y-4), 5, m["color"],-1,cv2.LINE_AA)
-            put(sb, f"M{i+1}", X+17, y, C_BRIGHT, 0.38, bold=True)
-            put(sb, val, X+42, y, m["color"], 0.38)
+                cv2.rectangle(sb, (X, y), (X+BW, y+22), (30, 30, 30), -1)
+            cv2.circle(sb, (X+9, y+11), 5, m["color"], -1, cv2.LINE_AA)
+            put(sb, f"M{i+1}", X+20, y+15, C_BRIGHT, 0.38)
+            put(sb, val,       X+46, y+15, m["color"],  0.38)
             if hov_m:
-                put(sb, "click to remove", X+80, y, (80,80,80), 0.27)
+                put(sb, "click to remove", X+86, y+15, (80, 80, 80), 0.27)
             i_cap = i
-            reg_hb(X, y-12, SB_W-16, 18,
+            reg_hb(X, y, BW, 22,
                    lambda ic=i_cap: markers.pop(ic) if ic < len(markers) else None)
-            y += 17
-        if y < IH-54:
+            y += 24
+        if y < IH - 54:
             put(sb, "Right-click on image to remove nearest", X, y, C_DIM, 0.27)
 
     # ── Bottom shortcuts ──────────────────────────────────────────────────────
-    bot = IH - 48
+    bot = IH - 44
     hline(sb, bot)
-    put(sb, "S = save snapshot    Q / Esc = quit", X, bot+16, C_DIM, 0.32)
-    put(sb, "Saves to ~/Desktop/BosonCaptures/", X, bot+30, C_DIM, 0.28)
+    put(sb, "S = snapshot    Q / Esc = quit",         X, bot+15, C_DIM, 0.31)
+    put(sb, "Recordings → ~/Desktop/BosonCaptures/",  X, bot+29, C_DIM, 0.27)
 
     return sb
 
@@ -781,6 +801,16 @@ def _action_start_calibrate():
         flatf.start(); nuc.reset()
         _action_set_view(0)
         status_msg = "Flat-field calibration started — aim at uniform surface"
+
+def _action_save_snapshot():
+    global status_msg
+    d  = os.path.expanduser("~/Desktop/BosonCaptures")
+    os.makedirs(d, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fn = os.path.join(d, f"thermal_{ts}.png")
+    if _canvas is not None:
+        cv2.imwrite(fn, _canvas)
+        status_msg = f"Saved → {os.path.basename(fn)}"
 
 # ── Camera image builder ──────────────────────────────────────────────────────
 
