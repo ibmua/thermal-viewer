@@ -156,11 +156,15 @@ class MotionGatedNUC:
     def update(self, f32: np.ndarray) -> np.ndarray:
         self._ensure()
         corrected = f32 - self.O
-        if self.prev is not None and np.mean(np.abs(f32-self.prev)) > self.thresh:
-            desired = cv2.GaussianBlur(corrected, self._ksize, self.sigma,
-                                       borderType=cv2.BORDER_REFLECT)
-            self.O  += self.mu * (corrected - desired)
-            self.updates += 1
+        if self.prev is not None:
+            # Sub-sample 1-in-4 in each axis (1/16 of pixels) for motion estimate —
+            # statistically identical result, ~16× less memory/arithmetic work.
+            mae = float(np.mean(np.abs(f32[::4, ::4] - self.prev[::4, ::4])))
+            if mae > self.thresh:
+                desired = cv2.GaussianBlur(corrected, self._ksize, self.sigma,
+                                           borderType=cv2.BORDER_REFLECT)
+                self.O  += self.mu * (corrected - desired)
+                self.updates += 1
         self.prev = f32.copy()
         return corrected
 
@@ -169,13 +173,32 @@ class MotionGatedNUC:
 
 
 class FlatFieldNUC:
-    """One-point flat-field calibration. Point at uniform surface, press F."""
+    """One-point flat-field calibration. Point at uniform surface, press F.
+
+    Dead-pixel detection uses two independent methods so nothing is missed:
+
+    Method A — Stuck / frozen pixels
+        Temporal std is far below the scene average.  A truly stuck pixel
+        never responds to scene changes, so its std ≈ 0.  Threshold: < 20 %
+        of the median std across all pixels.
+
+    Method B — Persistent spatial outliers (hot / cold pixels)
+        Even on a uniform scene some pixels are always much brighter or darker
+        than their immediate neighbours.  We compare each pixel's mean to a
+        9×9 Gaussian-blurred version of the mean; pixels in the top 0.8 % of
+        that local-deviation map (or > 3 σ above its mean) are flagged.
+
+    Both masks are OR'd together so any pixel caught by either method is
+    corrected with the 3×3 neighbourhood average.
+    """
     N = 64
 
     def __init__(self):
         self.correction  : Optional[np.ndarray] = None
-        self.bad_mask    : Optional[np.ndarray] = None
-        self.n_bad       = 0
+        self.bad_mask    : Optional[np.ndarray] = None   # all bad pixels combined
+        self.stuck_mask  : Optional[np.ndarray] = None   # method A only
+        self.outlier_mask: Optional[np.ndarray] = None   # method B only
+        self.n_bad = self.n_stuck = self.n_outlier = 0
         self.enabled     = False
         self.calibrating = False
         self._buf: List[np.ndarray] = []
@@ -198,37 +221,81 @@ class FlatFieldNUC:
         return False
 
     def _finish(self):
-        stack = np.stack(self._buf,0)
-        mean  = stack.mean(0); std = stack.std(0)
-        self.correction = (mean.mean()-mean).astype(np.float32)
-        self.bad_mask   = (std < np.median(std)*0.15)
-        self.n_bad      = int(self.bad_mask.sum())
-        self.calibrating=False; self.enabled=True; self._done_t=time.time()
-        self._buf=[]
-        np.savez(self.savepath, c=self.correction, b=self.bad_mask.astype(np.uint8))
-        print(f"  Flat-field done — {self.n_bad} stuck/dead pixels")
+        stack = np.stack(self._buf, 0)
+        mean  = stack.mean(0).astype(np.float32)
+        std   = stack.std(0).astype(np.float32)
+
+        # Per-pixel offset correction (subtracts the fixed-pattern offset)
+        self.correction = (mean.mean() - mean)
+
+        # ── Method A: stuck / frozen pixels ─────────────────────────────────
+        med_std = float(np.median(std))
+        self.stuck_mask = std < (med_std * 0.20)   # < 20 % of median std
+
+        # ── Method B: persistent spatial outliers (hot / cold pixels) ────────
+        # Compare each pixel's mean to its local neighbourhood average
+        local_avg = cv2.GaussianBlur(mean, (9, 9), 2.0)
+        local_dev = np.abs(mean - local_avg)
+        dev_p     = float(np.percentile(local_dev, 99.2))   # top 0.8 %
+        dev_sigma = float(local_dev.mean() + 3.0 * local_dev.std())
+        self.outlier_mask = local_dev > max(dev_p, dev_sigma)
+
+        # ── Combine ──────────────────────────────────────────────────────────
+        self.bad_mask  = self.stuck_mask | self.outlier_mask
+        self.n_stuck   = int(self.stuck_mask.sum())
+        self.n_outlier = int((self.outlier_mask & ~self.stuck_mask).sum())  # non-overlap
+        self.n_bad     = int(self.bad_mask.sum())
+
+        self.calibrating = False; self.enabled = True; self._done_t = time.time()
+        self._buf = []
+        np.savez(self.savepath,
+                 c=self.correction,
+                 b=self.bad_mask.astype(np.uint8),
+                 bs=self.stuck_mask.astype(np.uint8),
+                 bo=self.outlier_mask.astype(np.uint8))
+        print(f"  Flat-field done — {self.n_bad} bad px "
+              f"({self.n_stuck} stuck, {self.n_outlier} hot/cold)")
 
     def apply(self, f32: np.ndarray) -> np.ndarray:
         if not self.enabled or self.correction is None: return f32
         out = f32 + self.correction
         if self.n_bad > 0:
-            # Replace each dead/stuck pixel with the average of its 3×3 neighbours.
-            # cv2.blur() computes a box-filter mean; applying it to the whole image
-            # is fast, and we only copy the result at bad-pixel locations so good
-            # pixels are never affected.
+            # Replace every bad pixel with the mean of its 3×3 neighbours.
+            # cv2.blur() (box-filter mean) runs over the whole image in one
+            # O(n) integral-image pass; we then copy only at bad locations.
             neighbour_mean = cv2.blur(out, (3, 3))
             out[self.bad_mask] = neighbour_mean[self.bad_mask]
         return out
 
     def nuc_map_image(self, ci: int) -> np.ndarray:
+        """NUC correction heatmap with dead-pixel locations visually marked.
+
+        Background: correction strength (bright = pixel was too bright, dark = too dark).
+        Overlay:
+          Orange halo (3×3 dilated) — any bad pixel
+          Red centre dot             — stuck / frozen pixel  (method A)
+          Cyan centre dot            — hot / cold outlier    (method B)
+        """
         if self.correction is None:
-            return np.zeros((CAM_H,CAM_W,3), np.uint8)
-        n = cv2.normalize(self.correction,None,0,255,cv2.NORM_MINMAX,cv2.CV_8U)
-        return colorize(n, ci)
+            return np.zeros((CAM_H, CAM_W, 3), np.uint8)
+
+        n   = cv2.normalize(self.correction, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        img = colorize(n, ci).copy()
+
+        if self.bad_mask is not None and self.n_bad > 0:
+            kern    = np.ones((3, 3), np.uint8)
+            halo    = cv2.dilate(self.bad_mask.astype(np.uint8), kern).astype(bool)
+            img[halo]                = (30,  150, 255)   # orange halo
+            if self.stuck_mask   is not None:
+                img[self.stuck_mask]   = (40,  40,  220)   # red   — stuck/dead
+            if self.outlier_mask is not None:
+                img[self.outlier_mask & ~self.stuck_mask] = (220, 220, 0)  # cyan — hot/cold
+
+        return img
 
     def _load(self):
-        # Savepath uses CAM_W/CAM_H which may not be set yet at import time;
-        # defer loading to first access via load_if_needed()
+        # Savepath requires CAM_W/CAM_H which aren't set at import time;
+        # actual loading is deferred to load_if_needed() called after setup_layout().
         pass
 
     def load_if_needed(self):
@@ -237,9 +304,16 @@ class FlatFieldNUC:
         if not os.path.exists(p): return
         try:
             d = np.load(p)
-            self.correction=d["c"]; self.bad_mask=d["b"].astype(bool)
-            self.n_bad=int(self.bad_mask.sum()); self.enabled=True
-            print(f"  Loaded flat-field ({CAM_W}×{CAM_H}) — {self.n_bad} bad px")
+            self.correction   = d["c"]
+            self.bad_mask     = d["b"].astype(bool)
+            self.stuck_mask   = d["bs"].astype(bool) if "bs" in d else self.bad_mask
+            self.outlier_mask = d["bo"].astype(bool) if "bo" in d else np.zeros_like(self.bad_mask)
+            self.n_stuck      = int(self.stuck_mask.sum())
+            self.n_outlier    = int((self.outlier_mask & ~self.stuck_mask).sum())
+            self.n_bad        = int(self.bad_mask.sum())
+            self.enabled      = True
+            print(f"  Loaded flat-field ({CAM_W}×{CAM_H}) — "
+                  f"{self.n_bad} bad px ({self.n_stuck} stuck, {self.n_outlier} hot/cold)")
         except Exception as e:
             print(f"  Could not load flat-field: {e}")
 
@@ -378,6 +452,26 @@ mouse_x = mouse_y = 0
 # Sidebar click hitboxes — cleared and rebuilt each frame
 _hitboxes: List[Tuple[int,int,int,int,object]] = []  # (abs_x,y,w,h,action)
 
+# ── Pre-allocated display canvas (avoids 3 MB allocation per frame) ───────────
+_canvas: Optional[np.ndarray] = None
+
+def _ensure_canvas():
+    global _canvas
+    if _canvas is None or _canvas.shape[:2] != (WIN_H, WIN_W):
+        _canvas = np.zeros((WIN_H, WIN_W, 3), dtype=np.uint8)
+
+# ── Colormap strip cache (rebuild only when colormap changes) ─────────────────
+_cmap_strip_cache: dict = {}
+
+def _cmap_strip(w: int, h: int) -> np.ndarray:
+    """Return a (h,w,3) colorized gradient strip, cached per (cm_idx, w, h)."""
+    key = (cm_idx, w, h)
+    if key not in _cmap_strip_cache:
+        _cmap_strip_cache.clear()
+        bar = np.linspace(0, 255, w, dtype=np.uint8).reshape(1, -1)
+        _cmap_strip_cache[key] = cv2.resize(colorize(bar, cm_idx), (w, h))
+    return _cmap_strip_cache[key]
+
 # ── Sidebar mouse interaction ─────────────────────────────────────────────────
 
 def reg_hb(sb_x: int, y: int, w: int, h: int, action):
@@ -464,9 +558,8 @@ def draw_histogram(sb, x, y, w, h_px):
     if hist.max() == 0: return
     bar_h = (hist / hist.max() * (h_px - 3)).astype(np.int32)   # shape (w,)
 
-    # Build a full-size colored strip then mask above each bar — fully vectorised
-    bar1d   = np.linspace(0, 255, w, dtype=np.uint8).reshape(1, -1)
-    colored = cv2.resize(colorize(bar1d, cm_idx), (w, h_px))     # (h_px, w, 3)
+    # Build a full-size colored strip (cached) then mask above each bar — fully vectorised
+    colored = _cmap_strip(w, h_px).copy()    # copy so we can mask it in-place
     row_idx = np.arange(h_px, dtype=np.int32).reshape(-1, 1)     # (h_px, 1)
     mask    = row_idx < (h_px - bar_h).reshape(1, -1)            # (h_px, w)
     colored[mask] = (15, 15, 15)
@@ -516,10 +609,8 @@ def draw_sidebar(fps: float) -> np.ndarray:
     # ── Colormap ──────────────────────────────────────────────────────────────
     hline(sb, y); y += 10
     y = section(sb, X, y, "COLORMAP")
-    bar1d = np.linspace(0,255,SB_W-16,dtype=np.uint8).reshape(1,-1)
-    strip = cv2.resize(colorize(bar1d, cm_idx),(SB_W-16,14))
     hov_cm = hovering(X, y, SB_W-16, 14)
-    sb[y:y+14, X:X+SB_W-16] = strip
+    sb[y:y+14, X:X+SB_W-16] = _cmap_strip(SB_W-16, 14)   # cached
     cv2.rectangle(sb,(X,y),(X+SB_W-16,y+14), BORDER_HI if hov_cm else BORDER, 1)
     reg_hb(X, y, SB_W-16, 14, lambda: _action_cycle_cmap())
     y += 18
@@ -813,10 +904,12 @@ def main():
             fps_current = fps_n/(now-fps_t); fps_n=0; fps_t=now
 
         # ── Compose display ────────────────────────────────────────────────
-        img = last_img.copy()
+        # Only copy if we need to draw markers on top; otherwise use directly
+        need_draw = bool(markers) and view_mode != 1 and norm8 is not None
+        img = last_img.copy() if need_draw else last_img
 
         # Marker crosshairs
-        if view_mode != 1 and norm8 is not None:
+        if need_draw:
             for i, m in enumerate(markers):
                 cx = int((CAM_W-1-m["x"] if flip_h else m["x"])*SCALE)
                 cy = int((CAM_H-1-m["y"] if flip_v else m["y"])*SCALE)
@@ -847,25 +940,28 @@ def main():
             recorder.write(img)
 
         sidebar = draw_sidebar(fps_current)
-        top = np.hstack([img, sidebar])
 
-        # Status bar
-        bar = np.full((BAR_H, WIN_W, 3),(9,9,9),dtype=np.uint8)
-        cv2.line(bar,(0,0),(WIN_W,0),(38,38,38),1)
+        # Assemble into pre-allocated canvas — zero extra allocation per frame
+        _ensure_canvas()
+        _canvas[:IH, :IW]  = img
+        _canvas[:IH, IW:]  = sidebar
+        # Status bar (fill then draw text)
+        _canvas[IH:, :]    = (9, 9, 9)
+        cv2.line(_canvas, (0,IH), (WIN_W,IH), (38,38,38), 1)
         vm_col = {0:C_DIM, 1:C_ORANGE, 2:C_DIM}[view_mode]
-        put(bar, f"[{VIEW_MODES[view_mode].upper()}]", 8, 21, vm_col, 0.36)
+        put(_canvas, f"[{VIEW_MODES[view_mode].upper()}]", 8, IH+21, vm_col, 0.36)
         if frozen:
-            put(bar,"FROZEN — SPACE to resume", 80, 21, C_FROST, 0.38, bold=True)
+            put(_canvas, "FROZEN — SPACE to resume", 80, IH+21, C_FROST, 0.38)
         elif flatf.calibrating:
-            put(bar,f"Calibrating  {int(flatf.progress*100)}%  "
-                   f"({flatf.frames_captured}/{flatf.N}) — hold still",
-               80, 21, C_ORANGE, 0.38, bold=True)
+            put(_canvas, f"Calibrating  {int(flatf.progress*100)}%  "
+                        f"({flatf.frames_captured}/{flatf.N}) — hold still",
+               80, IH+21, C_ORANGE, 0.38)
         elif recorder.recording:
-            put(bar, f"● RECORDING  {recorder.elapsed:.0f}s", 80, 21, C_REC, 0.38, bold=True)
+            put(_canvas, f"● RECORDING  {recorder.elapsed:.0f}s", 80, IH+21, C_REC, 0.38)
         else:
-            put(bar, status_msg, 80, 21, (148,148,148), 0.36)
+            put(_canvas, status_msg, 80, IH+21, (148,148,148), 0.36)
 
-        cv2.imshow(WIN_NAME, np.vstack([top, bar]))
+        cv2.imshow(WIN_NAME, _canvas)
 
         # ── Keyboard ───────────────────────────────────────────────────────
         key = cv2.waitKey(1) & 0xFF
@@ -884,7 +980,7 @@ def main():
             os.makedirs(d, exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             fn = os.path.join(d, f"thermal_{ts}.png")
-            cv2.imwrite(fn, np.vstack([top, bar]))
+            cv2.imwrite(fn, _canvas)
             status_msg = f"Saved → {os.path.basename(fn)}"
 
     if recorder.recording: recorder.stop()
