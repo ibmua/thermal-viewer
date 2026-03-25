@@ -163,6 +163,8 @@ into the final MP4 when you stop.
   not auto-sleep / auto-lock from idle.
 - After saving, the sidebar shows a `LAST SAVE` card with clickable `OPEN` and
   `REVEAL` actions.
+- If disk space gets too low for the final audio/video mux, the sidebar warns
+  during recording and the final status makes it explicit that only video was saved.
 - If the final audio/video mux fails, the video is still preserved and the raw
   audio sidecar is left on disk next to it for recovery.
 

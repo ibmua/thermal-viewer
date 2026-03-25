@@ -57,8 +57,9 @@ gray  = np.random.randint(0, 256, 80*60, dtype=np.uint8)
 nuc_o = np.zeros(80*60, dtype=np.float32)
 prev  = np.zeros(80*60, dtype=np.float32)
 lut   = np.zeros(768,   dtype=np.uint8)
-out   = tc.process_frame(gray, 80, 60, nuc_o, prev, 0.05, 50.0, lut)
-assert len(out) == 80*60*3
+out   = np.empty(80*60*3, dtype=np.uint8)
+tc.process_frame(gray, 80, 60, nuc_o, prev, 0.05, 50.0, lut, out)
+assert out.shape == (80*60*3,)
 print("OK")
 EOF
 ```

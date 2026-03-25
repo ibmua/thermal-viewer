@@ -576,6 +576,7 @@ class VideoRecorder:
         self._sleep_guard_proc = None
         self._sleep_ping_thr: Optional[threading.Thread] = None
         self._sleep_ping_alive = False
+        self.last_result_note = ""
 
     @property
     def recording(self) -> bool:
@@ -647,6 +648,38 @@ class VideoRecorder:
                         pass
         except Exception:
             pass
+
+    @staticmethod
+    def _path_bytes(path: str) -> int:
+        try:
+            return os.path.getsize(path) if path and os.path.exists(path) else 0
+        except Exception:
+            return 0
+
+    def _mux_space_budget(self, video_path: str, audio_path: str) -> Tuple[int, int]:
+        if not video_path or not audio_path:
+            return 0, 0
+        base_dir = os.path.dirname(self.path or video_path) or '.'
+        try:
+            free_bytes = shutil.disk_usage(base_dir).free
+        except Exception:
+            return 0, 0
+        need_bytes = (
+            self._path_bytes(video_path) +
+            self._path_bytes(audio_path) +
+            128 * 1024 * 1024
+        )
+        return free_bytes, need_bytes
+
+    def current_mux_space_warning(self) -> str:
+        if not self.recording or not self.has_audio:
+            return ""
+        free_bytes, need_bytes = self._mux_space_budget(
+            self._vid_tmp or self.path, self._audio_tmp)
+        if not need_bytes or free_bytes >= need_bytes:
+            return ""
+        gib = 1024 ** 3
+        return f"Low disk: {free_bytes / gib:.1f}G free, need ~{need_bytes / gib:.1f}G"
 
     @classmethod
     def _sounddevice_inputs(cls) -> List[dict]:
@@ -983,6 +1016,7 @@ class VideoRecorder:
         self.target_fps  = max(float(fps), 1.0)
         self._ffmpeg_err = ""
         self._audio_final_args = ['-c:a', 'copy']
+        self.last_result_note = ""
 
         def _start_async_writer():
             self._write_q = queue.Queue(maxsize=32)
@@ -1328,6 +1362,13 @@ class VideoRecorder:
             video_path = self.path
 
         if video_ok and audio_ok:
+            free_bytes, need_bytes = self._mux_space_budget(video_path, self._audio_tmp)
+            if need_bytes and free_bytes < need_bytes:
+                sync_error = (f"low disk space ({free_bytes / (1024 * 1024):.0f} MiB free, "
+                              f"need about {need_bytes / (1024 * 1024):.0f} MiB for mux)")
+                audio_ok = False
+
+        if video_ok and audio_ok:
             video_start = self._video_frame_t0 or self._video_t0
             audio_start = self._audio_actual_t0 or self._audio_t0
             offset = audio_start - video_start if video_start and audio_start else 0.0
@@ -1367,17 +1408,25 @@ class VideoRecorder:
             if not audio_ok:
                 if video_path != self.path and os.path.exists(video_path):
                     shutil.move(video_path, self.path)
+                    video_path = self.path
 
         drop_note = f", dropped {self._dropped}" if self._dropped else ""
         if sync_error and not os.path.exists(self.path):
+            self.last_result_note = "Recording failed — final file was not written"
             print(f"  Recording failed (audio/video combine error: {sync_error})")
         elif audio_ok:
+            self.last_result_note = ""
             print(f"  Saved — {self._n} frames, {dur:.1f}s{drop_note}, muxed audio → {self.path}")
         elif self.has_audio and sync_error:
+            if 'low disk space' in sync_error.lower():
+                self.last_result_note = "Saved video only — low disk space blocked audio mux"
+            else:
+                self.last_result_note = "Saved video only — audio mux failed"
             extra = f" (raw audio kept at {self._audio_tmp})" if self._audio_tmp and os.path.exists(self._audio_tmp) else ""
             print(f"  Saved (audio mux failed: {sync_error}) — "
                   f"{self._n} frames, {dur:.1f}s{drop_note} → {self.path}{extra}")
         else:
+            self.last_result_note = ""
             print(f"  Saved — {self._n} frames, {dur:.1f}s{drop_note} → {self.path}")
         self._stop_sleep_guard()
         return self.path, self._n, dur
@@ -1706,7 +1755,7 @@ def to_cam(dx, dy):
     return max(0,min(cx,CAM_W-1)), max(0,min(cy,CAM_H-1))
 
 def mouse_cb(event, x, y, flags, _):
-    global mouse_x, mouse_y, status_msg
+    global mouse_x, mouse_y
     mouse_x, mouse_y = x, y
 
     if x >= IW:
@@ -1842,7 +1891,6 @@ def draw_histogram(sb, x, y, w, h_px):
 # ── Main sidebar ──────────────────────────────────────────────────────────────
 
 def draw_sidebar(fps: float) -> np.ndarray:
-    global status_msg
     _hitboxes.clear()
     sb = np.full((IH, SB_W, 3), BG, dtype=np.uint8)
     X  = 8
@@ -1923,6 +1971,10 @@ def draw_sidebar(fps: float) -> np.ndarray:
                      else "Recording active")
         put(sb, awake_msg, X+2, y, awake_col, 0.28)
         y += 11
+        disk_warn = recorder.current_mux_space_warning()
+        if disk_warn:
+            put(sb, disk_warn, X+2, y, C_ORANGE, 0.27)
+            y += 11
 
     # Mic-audio toggle — only drawn when a working microphone was detected at startup
     if _AUDIO_AVAILABLE:
@@ -2153,7 +2205,11 @@ def _action_toggle_record():
     if recorder.recording:
         path, n, dur = recorder.stop()
         _last_saved_path = path if path and os.path.exists(path) else ""
-        if _last_saved_path:
+        if recorder.last_result_note:
+            status_msg = f"{recorder.last_result_note}  {os.path.basename(path)}"
+            if _last_saved_path:
+                status_msg += "  — click OPEN LAST"
+        elif _last_saved_path:
             status_msg = (f"Saved {n} frames ({dur:.1f}s)  "
                           f"{os.path.basename(path)}  — click OPEN LAST")
         else:
@@ -2343,7 +2399,7 @@ def _read_ui_key(delay_ms: int = 1) -> Tuple[int, int]:
 
 def main():
     global norm8, raw_f, frame_stats, status_msg, nuc_auto_t
-    global frozen, view_mode, flip_h, flip_v, cm_idx, fps_current
+    global view_mode, fps_current
     global cam_fps, _sb_tick, _sb_cache, _pn, _pt
     global _tc_nuc_offset, _tc_prev_frame, _tc_out_buf
 

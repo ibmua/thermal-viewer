@@ -13,15 +13,17 @@
 //!   prev_frame = np.zeros(CAM_H * CAM_W, np.float32)
 //!   iron_flat  = iron_lut.ravel().astype(np.uint8)   # shape (768,)
 //!
-//!   bgr_bytes = thermal_core.process_frame(
+//!   out_buf = np.empty(CAM_H * CAM_W * 3, np.uint8)
+//!   thermal_core.process_frame(
 //!       gray.ravel(),          # 1-D uint8 numpy array
 //!       CAM_W, CAM_H,
 //!       nuc_offset,            # 1-D float32, modified in-place
 //!       prev_frame,            # 1-D float32, modified in-place
 //!       mu, thresh,
 //!       iron_flat,             # 1-D uint8 (256*3)
+//!       out_buf,               # 1-D uint8 output buffer
 //!   )
-//!   bgr = np.frombuffer(bgr_bytes, np.uint8).reshape(CAM_H, CAM_W, 3)
+//!   bgr = out_buf.reshape(CAM_H, CAM_W, 3)
 
 use numpy::{PyReadonlyArray1, PyReadwriteArray1};
 use pyo3::prelude::*;
@@ -34,11 +36,11 @@ fn hbox_blur_f32(src: &[f32], dst: &mut [f32], w: usize, r: usize) {
         let s = &src[row * w..(row + 1) * w];
         let d = &mut dst[row * w..(row + 1) * w];
         let mut sum: f32 = s[0] * (rr + 1) as f32;
-        for x in 0..=r.min(w - 1) { sum += s[x]; }
+        sum += s.iter().take(r.min(w - 1) + 1).copied().sum::<f32>();
         for x in 0..w {
             d[x] = sum / (2 * r + 1) as f32;
             let add = s[(x + r + 1).min(w - 1)];
-            let sub = if x as i64 - rr - 1 >= 0 { s[x - r - 1] } else { s[0] };
+            let sub = if x > r { s[x - r - 1] } else { s[0] };
             sum += add - sub;
         }
     }
@@ -52,7 +54,7 @@ fn vbox_blur_f32(src: &[f32], dst: &mut [f32], w: usize, h: usize, r: usize) {
         for y in 0..h {
             dst[y * w + col] = sum / (2 * r + 1) as f32;
             let ay = (y + r + 1).min(h - 1);
-            let sy = if y as i64 - rr - 1 >= 0 { y - r - 1 } else { 0 };
+            let sy = if y > r { y - r - 1 } else { 0 };
             sum += src[ay * w + col] - src[sy * w + col];
         }
     }
@@ -66,8 +68,8 @@ fn box_blur_f32(src: &[f32], tmp: &mut [f32], dst: &mut [f32], w: usize, h: usiz
 // ── Main entry point ──────────────────────────────────────────────────────────
 
 /// process_frame(gray, width, height, nuc_offset, prev_frame, mu, thresh, iron_lut,
-///               out_width=0, out_height=0, correction=None, bad_mask=None)
-///               -> bytes  (BGR uint8, out_width * out_height * 3)
+///               out_buf, out_width=0, out_height=0, correction=None, bad_mask=None)
+///               -> None
 ///
 /// gray        — 1-D contiguous uint8 numpy array, shape (width*height,)
 /// nuc_offset  — 1-D contiguous float32 numpy array, MODIFIED IN-PLACE
@@ -87,6 +89,7 @@ fn box_blur_f32(src: &[f32], tmp: &mut [f32], dst: &mut [f32], w: usize, h: usiz
 ///           no PyBytes copy.  Python side reuses the same buffer every frame.
 #[pyfunction]
 #[pyo3(signature = (gray, width, height, nuc_offset, prev_frame, mu, thresh, iron_lut, out_buf, out_width=0, out_height=0, correction=None, bad_mask=None))]
+#[allow(clippy::too_many_arguments)]
 fn process_frame<'py>(
     _py:          Python<'py>,
     gray:         PyReadonlyArray1<'py, u8>,
@@ -235,7 +238,7 @@ fn process_frame<'py>(
 }
 
 #[pymodule]
-fn thermal_core(_py: Python, m: &PyModule) -> PyResult<()> {
+fn thermal_core(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(process_frame, m)?)?;
     Ok(())
 }
