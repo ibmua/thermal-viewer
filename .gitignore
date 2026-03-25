@@ -42,5 +42,6 @@ thermal_core/target/
 *.m4a
 *.wav
 thermal_*.png
+!thermal_20260325_214528.png
 boson_*.png
 audio_mode_samples_*/

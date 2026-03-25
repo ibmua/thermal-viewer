@@ -6,6 +6,11 @@ Clean sidebar UI, real-time noise correction, flat-field calibration, recording.
 **60 fps** on supported hardware via an optional Rust extension (`thermal_core`).
 Falls back to pure-Python (~55 fps) with no setup required.
 
+![thermal-viewer screenshot](thermal_20260325_214528.png)
+
+Live Boson view with a clean thermal image, sidebar controls, bad-pixel handling,
+recording, audio capture, and one-click access to the last saved file.
+
 ---
 
 ## Quick start
