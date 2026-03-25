@@ -13,6 +13,22 @@ recording, audio capture, and one-click access to the last saved file.
 
 ---
 
+## Reality check
+
+This app was vibe-coded and, so far, tested only on macOS with the FLIR Boson 640
+sensor used during development.
+
+Other cameras and platforms may work, but they are not claimed to be equally
+validated yet. Camera detection, recording, audio, and UI behavior may need
+small machine-specific fixes.
+
+For the best experience, it is recommended to install and use this project
+through a coding agent. That makes it easy to adapt the app to your exact
+camera, OS, recorder setup, and workflow without having to manually untangle
+the codebase first.
+
+---
+
 ## Quick start
 
 ```bash
@@ -35,7 +51,9 @@ python3 thermal_viewer.py
 
 ## Supported cameras
 
-Auto-detected by resolution — no configuration needed.
+Auto-detected by resolution. The current heuristic list is broader than the
+real validation matrix; the Boson 640 on macOS is the setup that has actually
+been exercised the most.
 
 | Camera | Resolution | FPS |
 |---|---|---|
