@@ -8,8 +8,9 @@ name      = "thermal_core"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3    = { version = "0.21", features = ["extension-module"] }
-rayon   = "1.10"
+pyo3     = { version = "0.21", features = ["extension-module"] }
+numpy    = "0.21"
+rayon    = "1.10"
 bytemuck = "1.16"
 
 [profile.release]

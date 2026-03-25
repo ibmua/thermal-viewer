@@ -1,0 +1,125 @@
+name: Build & Release Wheels
+
+on:
+  push:
+    tags:
+      - "v*"          # trigger on v1.0.0, v1.2.3, etc.
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write   # needed to upload release assets
+
+jobs:
+  # ── Build the Rust extension wheel for every platform/Python combo ──────────
+  build-wheels:
+    name: ${{ matrix.os }} · Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-13, macos-14]
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # maturin-action handles Rust toolchain installation automatically
+      - name: Build wheel (maturin)
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: thermal_core
+          command: build
+          args: --release --strip --interpreter python${{ matrix.python-version }}
+          # On Linux use the manylinux image so the wheel is broadly compatible
+          manylinux: auto
+          # arm64 cross-compile when on macos-14 runner (Apple Silicon)
+          target: ${{ matrix.os == 'macos-14' && 'aarch64-apple-darwin' || '' }}
+
+      # Collect the .whl that maturin just produced
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: thermal_core/target/wheels/*.whl
+          if-no-files-found: error
+
+  # ── Run a quick smoke-test on each platform ─────────────────────────────────
+  test:
+    name: Smoke-test ${{ matrix.os }} · Python ${{ matrix.python-version }}
+    needs: build-wheels
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-13, macos-14]
+        python-version: ["3.9", "3.12"]   # only test oldest+newest to save time
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Download built wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: dist/
+
+      - name: Install wheel + runtime deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy opencv-python
+          pip install dist/*.whl
+
+      - name: Smoke-test import
+        run: |
+          python - <<'EOF'
+          import numpy as np, thermal_core as tc
+          # send a synthetic 80×60 frame through process_frame
+          gray   = np.random.randint(0, 65536, 80*60, dtype=np.uint8)
+          nuc_o  = np.zeros(80*60, dtype=np.float32)
+          prev_f = np.zeros(80*60, dtype=np.float32)
+          lut    = np.zeros(768, dtype=np.uint8)
+          out    = tc.process_frame(gray, 80, 60, nuc_o, prev_f, 0.05, 50.0, lut)
+          assert len(out) == 80*60*3, f"unexpected output size {len(out)}"
+          print("thermal_core smoke-test PASSED")
+          EOF
+
+  # ── Publish wheels to GitHub Release on tag push ────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [build-wheels, test]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/
+
+      - name: List wheels
+        run: ls -lh dist/
+
+      # Copy wheels into thermal_core/wheels/ so the install.sh pre-built path works
+      - name: Stage wheels for repo bundle
+        run: cp dist/*.whl thermal_core/wheels/
+
+      - name: Create GitHub Release and upload wheels
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.whl
+          generate_release_notes: true
+          fail_on_unmatched_files: true

@@ -14,12 +14,33 @@ Controls:
   Sidebar buttons    Clickable           Mouse hover   Highlights
   SPACE              Freeze / unfreeze   R             Record video on/off
   C                  Cycle colormap      N             Cycle view (Live/NUC Map/Raw)
-  D                  Motion NUC toggle   F             Flat-field calibrate
+  D                  Motion NUC toggle   F / Shift+F   Flat-field calibrate
   T                  Temporal smooth     H / V         Flip H / V
-  S                  Save snapshot       Q / Esc       Quit
+  S                  Save snapshot       A             Cycle audio input
+  Q / Esc            Quit
 """
 
-import cv2, numpy as np, time, os, threading
+import cv2, numpy as np, time, os, sys, threading, subprocess, shutil, queue, re, wave
+from collections import deque
+
+try:
+    import thermal_core as _tc
+    _HAS_TC = True
+except ImportError:
+    _HAS_TC = False
+
+try:
+    import sounddevice as sd
+    _HAS_SD = True
+except ImportError:
+    _HAS_SD = False
+
+try:
+    import AVFoundation
+    import Foundation
+    _HAS_AVAUDIORECORDER = True
+except ImportError:
+    _HAS_AVAUDIORECORDER = False
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
@@ -56,20 +77,22 @@ BAR_H     = 32      # status bar height
 
 # These are initialised in setup_layout():
 sensor    : Optional[SensorProfile] = None
-CAM_W = CAM_H = 640, 512   # overwritten
+CAM_W, CAM_H = 640, 512    # overwritten
 SCALE = 1.5
 IW    = 960
 IH    = 768
 WIN_W = IW + SB_W
 WIN_H = IH + BAR_H
+SCALE_INT = 1   # integer multiplier used by Rust norm8 sub-sample
 
 def setup_layout(s: SensorProfile):
-    global sensor, CAM_W, CAM_H, SCALE, IW, IH, WIN_W, WIN_H
+    global sensor, CAM_W, CAM_H, SCALE, IW, IH, WIN_W, WIN_H, SCALE_INT
     sensor = s
     CAM_W, CAM_H = s.w, s.h
     SCALE  = TARGET_IW / s.w
     IW     = int(s.w * SCALE)
     IH     = int(s.h * SCALE)
+    SCALE_INT = max(1, round(SCALE))
     WIN_W  = IW + SB_W
     WIN_H  = IH + BAR_H
 
@@ -121,7 +144,8 @@ def _build_iron_lut() -> np.ndarray:
                 lut[i,0] = [int(c0[k]+f*(c1[k]-c0[k])) for k in range(3)]
                 break
     return lut
-IRON_LUT = _build_iron_lut()
+IRON_LUT      = _build_iron_lut()
+IRON_LUT_FLAT = IRON_LUT[:, 0, :].ravel().copy()   # (768,) uint8 for thermal_core
 
 def colorize(gray8: np.ndarray, idx: int) -> np.ndarray:
     name, cv_cm = CMAPS[idx]
@@ -176,36 +200,71 @@ class MotionGatedNUC:
 
 
 class FlatFieldNUC:
-    """One-point flat-field calibration. Point at uniform surface, press F.
+    """Flat-field calibration — slowly slide camera over a uniform surface.
 
-    Dead-pixel detection uses two independent methods so nothing is missed:
+    Captures N frames while the camera moves, then detects bad pixels via
+    two independent methods:
 
     Method A — Stuck / frozen pixels
-        Temporal std is far below the scene average.  A truly stuck pixel
-        never responds to scene changes, so its std ≈ 0.  Threshold: < 20 %
-        of the median std across all pixels.
+        Temporal std AND temporal range are far below the sensor average.
+        A truly stuck pixel never responds to scene changes so both metrics
+        are near-zero.  Threshold: std < 25 % of median std, or range < 20 %
+        of median range.  Moving the camera during calibration maximises the
+        scene variation seen by good pixels, making stuck ones stand out more.
 
     Method B — Persistent spatial outliers (hot / cold pixels)
-        Even on a uniform scene some pixels are always much brighter or darker
-        than their immediate neighbours.  We compare each pixel's mean to a
-        9×9 Gaussian-blurred version of the mean; pixels in the top 0.8 % of
-        that local-deviation map (or > 3 σ above its mean) are flagged.
+        Each pixel's mean is compared to its 9×9 Gaussian-blurred local
+        average.  We use a MAD-based robust sigma so that the threshold
+        adapts to sensor quality rather than always flagging a fixed fraction.
+        Pixels more than 5 robust-σ above the median local deviation are
+        flagged.  Using a fixed percentile threshold (original code) always
+        flagged exactly 0.8 % regardless of sensor quality → false positives.
 
-    Both masks are OR'd together so any pixel caught by either method is
-    corrected with the 3×3 neighbourhood average.
+    Both masks are OR'd.  Bad pixels are replaced with the weighted mean of
+    their GOOD neighbours (5×5 kernel, bad pixels excluded from the kernel so
+    clusters don't contaminate each other).
+
+    Runtime discovery (see _rtbp_update) adds further bad pixels over time
+    as the camera operates normally.  Those are tracked separately from the
+    calibration masks so they can be revalidated and removed later if they
+    stop behaving like isolated bad pixels.
+
+    Two calibration modes (F vs Shift+F):
+
+    'offset' (F) — colour calibration only.
+        32 frames, uniform surface or lens cap.  Recomputes the per-pixel
+        additive offset so colour / brightness looks correct after the sensor
+        warms up.  Existing calibration bad pixels are revalidated, but this
+        quick mode does not aggressively discover new ones from scratch, since
+        random live scenes can otherwise create large false-positive clusters.
+        Runtime-confirmed pixels are preserved separately and revalidated
+        during live use.
+
+    'full' (Shift+F) — full calibration.
+        128 frames, slide slowly over a uniform surface.  Recomputes both the
+        offset correction AND the complete dead-pixel map from scratch.  Use
+        this when first setting up or after replacing the camera.
     """
-    N = 64
+    N_OFFSET = 32    # frames for colour-only calibration
+    N_FULL   = 128   # frames for full calibration
 
     def __init__(self):
         self.correction  : Optional[np.ndarray] = None
         self.bad_mask    : Optional[np.ndarray] = None   # all bad pixels combined
         self.stuck_mask  : Optional[np.ndarray] = None   # method A only
         self.outlier_mask: Optional[np.ndarray] = None   # method B only
-        self.n_bad = self.n_stuck = self.n_outlier = 0
+        self.runtime_mask: Optional[np.ndarray] = None   # runtime-found bad pixels
+        self.n_bad = self.n_stuck = self.n_outlier = self.n_runtime = 0
         self.enabled     = False
         self.calibrating = False
+        self._mode       = 'offset'   # current calibration mode
+        self.N           = self.N_OFFSET
         self._buf: List[np.ndarray] = []
         self._done_t: float = 0
+        # Pre-built flat contiguous arrays for Rust — recomputed only when the
+        # masks change (calibration done / runtime pixel added), NOT every frame.
+        self.corr_flat: Optional[np.ndarray] = None   # float32 (CAM_H*CAM_W,)
+        self.bad_flat : Optional[np.ndarray] = None   # uint8   (CAM_H*CAM_W,)
         self._load()
 
     @property
@@ -214,8 +273,52 @@ class FlatFieldNUC:
         os.makedirs(d, exist_ok=True)
         return os.path.join(d, f"flatfield_{CAM_W}x{CAM_H}.npz")
 
-    def start(self):
-        self._buf=[]; self.calibrating=True; self._done_t=0
+    def start(self, mode: str = 'offset'):
+        """Begin a calibration capture.
+        mode='offset'  — F key:       32 frames, revalidates existing calibration bad pixels.
+        mode='full'    — Shift+F key: 128 frames, full dead-pixel re-detection.
+        """
+        self._mode = mode
+        self.N     = self.N_FULL if mode == 'full' else self.N_OFFSET
+        self._buf  = []; self.calibrating = True; self._done_t = 0
+
+    def _empty_mask(self) -> np.ndarray:
+        if self.correction is not None:
+            return np.zeros_like(self.correction, dtype=bool)
+        return np.zeros((CAM_H, CAM_W), dtype=bool)
+
+    def calibration_mask(self) -> np.ndarray:
+        stuck = self.stuck_mask if self.stuck_mask is not None else self._empty_mask()
+        out   = self.outlier_mask if self.outlier_mask is not None else self._empty_mask()
+        return stuck | out
+
+    def _sync_masks(self, persist: bool = False) -> None:
+        if self.stuck_mask is None and self.outlier_mask is None and self.runtime_mask is None:
+            self.bad_mask = None
+            self.n_bad = self.n_stuck = self.n_outlier = self.n_runtime = 0
+            self._rebuild_flat_cache()
+            return
+
+        cal_bad = self.calibration_mask()
+        runtime = self.runtime_mask if self.runtime_mask is not None else np.zeros_like(cal_bad)
+        runtime = runtime & ~cal_bad
+        self.runtime_mask = runtime
+        self.bad_mask = cal_bad | runtime
+        self.n_stuck = int(self.stuck_mask.sum()) if self.stuck_mask is not None else 0
+        self.n_outlier = int((self.outlier_mask & ~self.stuck_mask).sum()) \
+            if self.outlier_mask is not None and self.stuck_mask is not None else 0
+        self.n_runtime = int(runtime.sum())
+        self.n_bad = int(self.bad_mask.sum())
+        self._rebuild_flat_cache()
+        if persist and self.correction is not None:
+            np.savez(
+                self.savepath,
+                c=self.correction,
+                b=self.bad_mask.astype(np.uint8),
+                bs=self.stuck_mask.astype(np.uint8) if self.stuck_mask is not None else np.zeros_like(self.bad_mask, np.uint8),
+                bo=self.outlier_mask.astype(np.uint8) if self.outlier_mask is not None else np.zeros_like(self.bad_mask, np.uint8),
+                br=self.runtime_mask.astype(np.uint8) if self.runtime_mask is not None else np.zeros_like(self.bad_mask, np.uint8),
+            )
 
     def feed(self, f32: np.ndarray) -> bool:
         if not self.calibrating: return False
@@ -228,46 +331,89 @@ class FlatFieldNUC:
         mean  = stack.mean(0).astype(np.float32)
         std   = stack.std(0).astype(np.float32)
 
-        # Per-pixel offset correction (subtracts the fixed-pattern offset)
+        # Per-pixel offset correction.  Works correctly for moving or static
+        # calibration over a uniform surface — the per-pixel mean converges to
+        # the global mean for good pixels; stuck pixels always deviate.
         self.correction = (mean.mean() - mean)
 
-        # ── Method A: stuck / frozen pixels ─────────────────────────────────
-        med_std = float(np.median(std))
-        self.stuck_mask = std < (med_std * 0.20)   # < 20 % of median std
+        # ── Dead-pixel detection (run in both modes) ──────────────────────────
+        # Method A: stuck / frozen pixels
+        med_std   = float(np.median(std))
+        pix_range = (stack.max(0) - stack.min(0)).astype(np.float32)
+        med_range = float(np.median(pix_range))
+        # Compare against both the global distribution and the local temporal
+        # activity field.  If a whole region barely moved during calibration we
+        # do NOT want to mark that whole region as "stuck".
+        local_std   = cv2.blur(std, (9, 9))
+        local_range = cv2.blur(pix_range, (9, 9))
+        new_stuck = (
+            (std < (med_std * 0.25)) &
+            (pix_range < (med_range * 0.20)) &
+            (std < (local_std * 0.55)) &
+            (pix_range < (local_range * 0.55))
+        )
 
-        # ── Method B: persistent spatial outliers (hot / cold pixels) ────────
-        # Compare each pixel's mean to its local neighbourhood average
-        local_avg = cv2.GaussianBlur(mean, (9, 9), 2.0)
-        local_dev = np.abs(mean - local_avg)
-        dev_p     = float(np.percentile(local_dev, 99.2))   # top 0.8 %
-        dev_sigma = float(local_dev.mean() + 3.0 * local_dev.std())
-        self.outlier_mask = local_dev > max(dev_p, dev_sigma)
+        # Method B: persistent spatial outliers (hot / cold pixels)
+        local_avg  = cv2.GaussianBlur(mean, (9, 9), 2.0)
+        local_dev  = np.abs(mean - local_avg)
+        med_dev    = float(np.median(local_dev))
+        mad        = float(np.median(np.abs(local_dev - med_dev)))
+        rob_sigma  = 1.4826 * mad
+        threshold  = max(med_dev + 5.0 * rob_sigma, 1.0)
+        new_outlier = local_dev > threshold
 
-        # ── Combine ──────────────────────────────────────────────────────────
-        self.bad_mask  = self.stuck_mask | self.outlier_mask
-        self.n_stuck   = int(self.stuck_mask.sum())
-        self.n_outlier = int((self.outlier_mask & ~self.stuck_mask).sum())  # non-overlap
-        self.n_bad     = int(self.bad_mask.sum())
+        prior_cal = self.calibration_mask() if (self.stuck_mask is not None or self.outlier_mask is not None) \
+            else np.zeros_like(new_stuck)
+        prior_rt = self.runtime_mask.copy() if self.runtime_mask is not None else np.zeros_like(new_stuck)
+        prior_all = prior_cal | prior_rt
+
+        prior_stuck = self.stuck_mask.copy() if self.stuck_mask is not None else np.zeros_like(new_stuck)
+        prior_outlier = self.outlier_mask.copy() if self.outlier_mask is not None else np.zeros_like(new_stuck)
+
+        # Full calibration rebuilds the dead-pixel DB from scratch.
+        # Colour-only calibration only revalidates the existing calibration
+        # masks.  That makes F safe to use during normal operation instead of
+        # letting arbitrary scene content generate a giant new bad-pixel block.
+        if self._mode == 'full':
+            self.stuck_mask = new_stuck
+            self.outlier_mask = new_outlier
+            self.runtime_mask = np.zeros_like(prior_rt)
+        else:
+            self.stuck_mask = prior_stuck & new_stuck
+            self.outlier_mask = prior_outlier & new_outlier
+            self.runtime_mask = prior_rt & ~(self.stuck_mask | self.outlier_mask)
+        removed_total = int((prior_all & ~(self.stuck_mask | self.outlier_mask | self.runtime_mask)).sum())
 
         self.calibrating = False; self.enabled = True; self._done_t = time.time()
         self._buf = []
-        np.savez(self.savepath,
-                 c=self.correction,
-                 b=self.bad_mask.astype(np.uint8),
-                 bs=self.stuck_mask.astype(np.uint8),
-                 bo=self.outlier_mask.astype(np.uint8))
-        print(f"  Flat-field done — {self.n_bad} bad px "
-              f"({self.n_stuck} stuck, {self.n_outlier} hot/cold)")
+        self._sync_masks(persist=True)
+        mode_tag = "full" if self._mode == 'full' else "colour"
+        refresh_note = f", removed {removed_total} stale" if removed_total else ""
+        print(f"  Flat-field ({mode_tag}) done — {self.n_bad} bad px "
+              f"({self.n_stuck} stuck, {self.n_outlier} hot/cold{refresh_note})")
 
     def apply(self, f32: np.ndarray) -> np.ndarray:
         if not self.enabled or self.correction is None: return f32
         out = f32 + self.correction
         if self.n_bad > 0:
-            # Replace every bad pixel with the mean of its 3×3 neighbours.
-            # cv2.blur() (box-filter mean) runs over the whole image in one
-            # O(n) integral-image pass; we then copy only at bad locations.
-            neighbour_mean = cv2.blur(out, (3, 3))
-            out[self.bad_mask] = neighbour_mean[self.bad_mask]
+            # Replace bad pixels with the weighted mean of their GOOD neighbours.
+            # Zero bad pixels before blurring so they don't contaminate the
+            # kernel average (original bug: blur included the bad pixel itself,
+            # so a stuck pixel offset of 1000 ADU leaked ~111 ADU into its own
+            # replacement → visible dot remained).
+            #
+            # cv2.blur(x, k) = Σx / k²  ← identical divisor for all positions
+            # → blur(good_f) / blur(good_wt) = Σ(good values) / count(good)
+            #   = true mean of good neighbours only.
+            good_f  = out.copy()
+            good_f[self.bad_mask] = 0.0
+            good_wt = (~self.bad_mask).astype(np.float32)
+            nbr_sum = cv2.blur(good_f, (5, 5))   # Σ(good_values) / 25
+            nbr_cnt = cv2.blur(good_wt, (5, 5))  # count(good) / 25
+            # In-place divide where we have at least one good neighbour
+            valid = nbr_cnt > 0
+            nbr_sum[valid] /= nbr_cnt[valid]
+            out[self.bad_mask] = nbr_sum[self.bad_mask]
         return out
 
     def nuc_map_image(self, ci: int) -> np.ndarray:
@@ -282,7 +428,13 @@ class FlatFieldNUC:
         if self.correction is None:
             return np.zeros((CAM_H, CAM_W, 3), np.uint8)
 
-        n   = cv2.normalize(self.correction, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+        # Stable symmetric scaling around zero makes successive NUC maps far
+        # easier to compare.  Plain min/max normalization can make two very
+        # similar correction fields look wildly different just because of one
+        # extreme outlier pixel.
+        lim = float(np.percentile(np.abs(self.correction), 99.5))
+        lim = max(lim, 1.0)
+        n   = np.clip((self.correction / lim) * 127.5 + 127.5, 0, 255).astype(np.uint8)
         img = colorize(n, ci).copy()
 
         if self.bad_mask is not None and self.n_bad > 0:
@@ -308,17 +460,56 @@ class FlatFieldNUC:
         try:
             d = np.load(p)
             self.correction   = d["c"]
-            self.bad_mask     = d["b"].astype(bool)
-            self.stuck_mask   = d["bs"].astype(bool) if "bs" in d else self.bad_mask
-            self.outlier_mask = d["bo"].astype(bool) if "bo" in d else np.zeros_like(self.bad_mask)
-            self.n_stuck      = int(self.stuck_mask.sum())
-            self.n_outlier    = int((self.outlier_mask & ~self.stuck_mask).sum())
-            self.n_bad        = int(self.bad_mask.sum())
+            loaded_bad        = d["b"].astype(bool)
+            self.stuck_mask   = d["bs"].astype(bool) if "bs" in d else loaded_bad
+            self.outlier_mask = d["bo"].astype(bool) if "bo" in d else np.zeros_like(loaded_bad)
+            if "br" in d:
+                self.runtime_mask = d["br"].astype(bool)
+            else:
+                self.runtime_mask = loaded_bad & ~(self.stuck_mask | self.outlier_mask)
             self.enabled      = True
+            self._sync_masks()
             print(f"  Loaded flat-field ({CAM_W}×{CAM_H}) — "
-                  f"{self.n_bad} bad px ({self.n_stuck} stuck, {self.n_outlier} hot/cold)")
+                  f"{self.n_bad} bad px ({self.n_stuck} stuck, {self.n_outlier} hot/cold"
+                  f"{f', {self.n_runtime} runtime' if self.n_runtime else ''})")
         except Exception as e:
             print(f"  Could not load flat-field: {e}")
+
+    def _rebuild_flat_cache(self) -> None:
+        """Rebuild corr_flat / bad_flat contiguous arrays used by Rust.
+        Called after any mask change so the hot path never recomputes them."""
+        if self.correction is not None:
+            self.corr_flat = np.ascontiguousarray(
+                self.correction.ravel().astype(np.float32))
+        else:
+            self.corr_flat = None
+        if self.bad_mask is not None:
+            self.bad_flat = np.ascontiguousarray(
+                self.bad_mask.ravel().astype(np.uint8))
+        else:
+            self.bad_flat = None
+
+    def add_runtime_bad(self, new_mask: np.ndarray) -> int:
+        """Merge runtime-discovered bad pixels into bad_mask.  Returns count added."""
+        if self.runtime_mask is None:
+            self.runtime_mask = np.zeros_like(new_mask, dtype=bool)
+        newly = new_mask & ~self.runtime_mask & ~self.calibration_mask()
+        if not newly.any():
+            return 0
+        self.runtime_mask |= newly
+        self._sync_masks(persist=True)   # keep Rust-side bad_flat in sync + save DB
+        return int(newly.sum())
+
+    def remove_runtime_bad(self, clear_mask: np.ndarray) -> int:
+        """Remove runtime pixels that no longer behave like bad pixels."""
+        if self.runtime_mask is None:
+            return 0
+        removed = clear_mask & self.runtime_mask
+        if not removed.any():
+            return 0
+        self.runtime_mask = self.runtime_mask & ~removed
+        self._sync_masks(persist=True)
+        return int(removed.sum())
 
     @property
     def progress(self): return len(self._buf)/self.N if self.calibrating else 0.0
@@ -340,52 +531,875 @@ class TemporalSmoother:
 # ── Video recorder ────────────────────────────────────────────────────────────
 
 class VideoRecorder:
-    """Records the colorized camera image to an .mp4 file."""
+    """Records the colourised thermal video, optionally with microphone audio.
+
+    Video and audio are captured independently, then muxed together at stop.
+    This keeps the microphone capture path isolated from the video encoder so
+    transient issues in one path are less likely to glitch the other.  Falls
+    back to video-only if no usable audio backend is available.
+
+    Platform audio input:
+      macOS   — CoreAudio via sounddevice (preferred), ffmpeg fallback
+      Linux   — PulseAudio    (-f pulse -i default)
+      Windows — DirectShow    (-f dshow -i audio=default)
+    """
+    _mac_audio_input_spec: Optional[str] = None
+    _audio_input_index: Optional[int] = None
+    _audio_input_label: str = ""
+
     def __init__(self):
-        self._writer: Optional[cv2.VideoWriter] = None
-        self.path = ""
-        self._t0  = 0.0
-        self._n   = 0
+        self._writer    : Optional[cv2.VideoWriter] = None
+        self._ffmpeg_proc = None   # optional ffmpeg video-only encoder
+        self._audio_proc = None    # optional ffmpeg audio-only capture
+        self._audio_recorder = None
+        self._audio_stream = None  # optional sounddevice capture stream
+        self._audio_wave = None    # optional wave writer for sounddevice capture
+        self._audio_write_q: Optional["queue.Queue[Optional[bytes]]"] = None
+        self._audio_write_thr: Optional[threading.Thread] = None
+        self._audio_backend = ""
+        self._write_q   : Optional["queue.Queue[Optional[np.ndarray]]"] = None
+        self._write_thr : Optional[threading.Thread] = None
+        self.path       = ""
+        self._vid_tmp   = ""
+        self._audio_tmp = ""
+        self._t0        = 0.0
+        self._video_t0  = 0.0
+        self._video_frame_t0 = 0.0
+        self._audio_t0  = 0.0
+        self._audio_actual_t0 = 0.0
+        self._n         = 0
+        self._dropped   = 0
+        self.has_audio  = False
+        self.target_fps = 0.0
+        self._ffmpeg_err = ""
+        self._audio_final_args: List[str] = ['-c:a', 'copy']
+        self._sleep_guard_proc = None
+        self._sleep_ping_thr: Optional[threading.Thread] = None
+        self._sleep_ping_alive = False
 
     @property
     def recording(self) -> bool:
-        return self._writer is not None
+        return (
+            self._writer is not None or
+            (self._ffmpeg_proc is not None and self._ffmpeg_proc.poll() is None)
+        )
 
-    def start(self, w: int, h: int, fps: float):
+    @property
+    def keeping_screen_awake(self) -> bool:
+        return self._sleep_guard_proc is not None and self._sleep_guard_proc.poll() is None
+
+    def _sleep_ping_loop(self) -> None:
+        caffeinate = shutil.which('caffeinate')
+        if not caffeinate:
+            return
+        while self._sleep_ping_alive:
+            try:
+                subprocess.run(
+                    [caffeinate, '-u', '-t', '5'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+            except Exception:
+                return
+
+    def _start_sleep_guard(self) -> None:
+        if sys.platform != 'darwin':
+            return
+        caffeinate = shutil.which('caffeinate')
+        if not caffeinate:
+            return
+        self._stop_sleep_guard()
+        try:
+            self._sleep_guard_proc = subprocess.Popen(
+                [caffeinate, '-dims'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            self._sleep_ping_alive = True
+            self._sleep_ping_thr = threading.Thread(
+                target=self._sleep_ping_loop, daemon=True)
+            self._sleep_ping_thr.start()
+        except Exception:
+            self._sleep_guard_proc = None
+            self._sleep_ping_alive = False
+            self._sleep_ping_thr = None
+
+    def _stop_sleep_guard(self) -> None:
+        self._sleep_ping_alive = False
+        if self._sleep_ping_thr is not None:
+            self._sleep_ping_thr.join(timeout=1.5)
+            self._sleep_ping_thr = None
+        proc = self._sleep_guard_proc
+        self._sleep_guard_proc = None
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    @classmethod
+    def _sounddevice_inputs(cls) -> List[dict]:
+        if not _HAS_SD:
+            return []
+        try:
+            devices = []
+            for idx, d in enumerate(sd.query_devices()):
+                max_in = int(d.get('max_input_channels', 0))
+                if max_in > 0:
+                    devices.append({
+                        'index': idx,
+                        'name': str(d.get('name', f'Input {idx}')),
+                        'channels': max_in,
+                        'samplerate': int(d.get('default_samplerate', 48000) or 48000),
+                    })
+            return devices
+        except Exception:
+            return []
+
+    @classmethod
+    def _mac_default_input_label(cls) -> str:
+        try:
+            sp = subprocess.run(
+                ['system_profiler', 'SPAudioDataType'],
+                capture_output=True, text=True, timeout=5)
+        except Exception:
+            return ""
+
+        default_source = ""
+        default_device = ""
+        current_name = ""
+        for line in sp.stdout.splitlines():
+            m = re.match(r'^\s{8}(.+):\s*$', line)
+            if m:
+                current_name = m.group(1)
+                continue
+            if 'Input Source: Default' in line and current_name:
+                default_source = current_name
+            if 'Default Input Device: Yes' in line and current_name:
+                default_device = current_name
+        return default_source or default_device
+
+    @classmethod
+    def _choose_sounddevice_input(cls, advance: int = 0) -> dict:
+        inputs = cls._sounddevice_inputs()
+        if not inputs:
+            raise RuntimeError("no CoreAudio input devices found")
+
+        indices = [d['index'] for d in inputs]
+        if cls._audio_input_index in indices:
+            pos = indices.index(cls._audio_input_index)
+            choice = inputs[(pos + advance) % len(inputs)]
+        else:
+            default_idx = None
+            try:
+                default_idx = int(sd.default.device[0])
+            except Exception:
+                pass
+            choice = None
+            # Prefer an external hardware mic over the built-in or virtual inputs.
+            for d in inputs:
+                lname = d['name'].lower()
+                if 'teams' in lname:
+                    continue
+                if 'dji' in lname or ('macbook' not in lname and 'built-in' not in lname):
+                    choice = d
+                    break
+            if choice is None and default_idx in indices:
+                choice = inputs[indices.index(default_idx)]
+            if choice is None:
+                choice = inputs[0]
+
+        cls._audio_input_index = int(choice['index'])
+        cls._audio_input_label = f"{choice['name']} (sd:{choice['index']})"
+        return choice
+
+    @classmethod
+    def cycle_audio_input(cls) -> str:
+        if sys.platform == 'darwin' and _HAS_AVAUDIORECORDER:
+            return ""
+        if sys.platform == 'darwin' and _HAS_SD:
+            try:
+                cls._choose_sounddevice_input(advance=1)
+                return cls._audio_input_label
+            except Exception:
+                return ""
+        return ""
+
+    @classmethod
+    def _audio_input_args(cls) -> list:
+        """ffmpeg input flags for the default microphone on this platform."""
+        if sys.platform == 'darwin':
+            return cls._mac_audio_input_args()
+        elif sys.platform == 'win32':
+            cls._audio_input_label = "default DirectShow audio device"
+            return ['-f', 'dshow', '-i', 'audio=default']
+        else:   # Linux / BSD
+            cls._audio_input_label = "default PulseAudio input"
+            return ['-f', 'pulse', '-i', 'default']
+
+    @classmethod
+    def _mac_audio_input_args(cls) -> list:
+        if cls._mac_audio_input_spec is not None:
+            return ['-f', 'avfoundation', '-i', cls._mac_audio_input_spec]
+
+        default_name = ""
+        try:
+            sp = subprocess.run(
+                ['system_profiler', 'SPAudioDataType'],
+                capture_output=True, text=True, timeout=5)
+            current_name = ""
+            for line in sp.stdout.splitlines():
+                m = re.match(r'^\s{8}(.+):\s*$', line)
+                if m:
+                    current_name = m.group(1)
+                    continue
+                if 'Default Input Device: Yes' in line and current_name:
+                    default_name = current_name
+                    break
+        except Exception:
+            pass
+
+        devices = []
+        try:
+            r = subprocess.run(
+                ['ffmpeg', '-f', 'avfoundation', '-list_devices', 'true', '-i', ''],
+                capture_output=True, text=True, timeout=5)
+            out = (r.stderr or '') + '\n' + (r.stdout or '')
+            in_audio = False
+            for line in out.splitlines():
+                if 'AVFoundation audio devices:' in line:
+                    in_audio = True
+                    continue
+                if not in_audio:
+                    continue
+                m = re.search(r'\[(\d+)\]\s+(.+)$', line)
+                if m:
+                    devices.append((m.group(1), m.group(2).strip()))
+        except Exception:
+            pass
+
+        spec = ':0'
+        selected_name = ""
+        if default_name:
+            for idx, name in devices:
+                if name == default_name:
+                    spec = f':{idx}'
+                    selected_name = name
+                    break
+        if spec == ':0':
+            for idx, name in devices:
+                if 'Microphone' in name:
+                    spec = f':{idx}'
+                    selected_name = name
+                    break
+        if not selected_name and devices:
+            audio_idx = spec[1:] if spec.startswith(':') else spec
+            for idx, name in devices:
+                if idx == audio_idx:
+                    selected_name = name
+                    break
+        cls._mac_audio_input_spec = spec
+        cls._audio_input_label = f"{selected_name} ({spec})" if selected_name else spec
+        return ['-f', 'avfoundation', '-i', spec]
+
+    @classmethod
+    def audio_input_label(cls) -> str:
+        if cls._audio_input_label:
+            return cls._audio_input_label
+        try:
+            cls.refresh_audio_input()
+        except Exception:
+            pass
+        return cls._audio_input_label
+
+    @classmethod
+    def refresh_audio_input(cls) -> None:
+        cls._audio_input_label = ""
+        if sys.platform == 'darwin' and _HAS_AVAUDIORECORDER:
+            label = cls._mac_default_input_label()
+            if label:
+                cls._audio_input_label = f"{label} (system default)"
+                return
+        if sys.platform == 'darwin' and _HAS_SD:
+            try:
+                cls._choose_sounddevice_input()
+                return
+            except Exception:
+                pass
+        cls._mac_audio_input_spec = None
+        try:
+            cls._audio_input_args()
+        except Exception:
+            pass
+
+    @staticmethod
+    def probe_audio() -> bool:
+        """Return True if ffmpeg can open the default microphone right now.
+
+        Starts a real capture subprocess, waits 400 ms, checks it is still
+        running, then kills it.  This is the only reliable way to detect
+        macOS permission denials, missing devices, etc.
+        """
+        if sys.platform == 'darwin' and _HAS_AVAUDIORECORDER:
+            path = os.path.join('/tmp', f'codex_probe_{os.getpid()}.m4a')
+            try:
+                url = Foundation.NSURL.fileURLWithPath_(path)
+                settings = {
+                    AVFoundation.AVFormatIDKey: AVFoundation.kAudioFormatMPEG4AAC,
+                    AVFoundation.AVSampleRateKey: 48000.0,
+                    AVFoundation.AVNumberOfChannelsKey: 1,
+                    AVFoundation.AVEncoderBitRateKey: 128000,
+                    AVFoundation.AVEncoderAudioQualityKey: AVFoundation.AVAudioQualityHigh,
+                }
+                rec, err = AVFoundation.AVAudioRecorder.alloc().initWithURL_settings_error_(
+                    url, settings, None)
+                if rec is None:
+                    return False
+                if not rec.prepareToRecord() or not rec.record():
+                    return False
+                time.sleep(0.2)
+                rec.stop()
+                time.sleep(0.05)
+                VideoRecorder.refresh_audio_input()
+                return True
+            except Exception:
+                return False
+            finally:
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+        if sys.platform == 'darwin' and _HAS_SD:
+            try:
+                choice = VideoRecorder._choose_sounddevice_input()
+                channels = max(1, min(2, int(choice['channels'])))
+                stream = sd.RawInputStream(
+                    samplerate=int(choice['samplerate']),
+                    blocksize=1024,
+                    channels=channels,
+                    dtype='int16',
+                    device=int(choice['index']),
+                )
+                stream.start()
+                time.sleep(0.2)
+                stream.stop()
+                stream.close()
+                return True
+            except Exception:
+                return False
+        if not shutil.which('ffmpeg'):
+            return False
+        try:
+            VideoRecorder.refresh_audio_input()
+            proc = subprocess.Popen(
+                ['ffmpeg', '-y'] + VideoRecorder._audio_input_args() +
+                ['-ar', '44100', '-ac', '1', '-t', '1', '-f', 'null', '-'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            time.sleep(0.4)
+            rc = proc.poll()
+            proc.terminate()
+            try: proc.wait(timeout=2)
+            except Exception: pass
+            # If it exited in <0.4 s it almost certainly failed immediately
+            return rc is None
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ffmpeg_video_arg_sets() -> List[List[str]]:
+        if sys.platform == 'darwin':
+            return [
+                # Prefer the hardware encoder on macOS so 60 fps capture stays
+                # reliable, but give it substantially more bitrate than before.
+                ['-c:v', 'h264_videotoolbox', '-allow_sw', '1',
+                 '-b:v', '24M', '-maxrate', '32M', '-bufsize', '48M'],
+                ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '14'],
+                ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '16'],
+                ['-c:v', 'mpeg4', '-q:v', '2'],
+            ]
+        return [
+            ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '14'],
+            ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '16'],
+            ['-c:v', 'mpeg4', '-q:v', '2'],
+        ]
+
+    @staticmethod
+    def _read_process_error(proc) -> str:
+        if proc is None or proc.stderr is None:
+            return ""
+        try:
+            err = proc.stderr.read().decode(errors='replace').strip()
+        except Exception:
+            return ""
+        return err[-400:] if err else ""
+
+    def _audio_writer_loop(self):
+        while self._audio_write_q is not None:
+            chunk = self._audio_write_q.get()
+            if chunk is None:
+                break
+            try:
+                if self._audio_wave is not None:
+                    self._audio_wave.writeframesraw(chunk)
+            except Exception:
+                break
+
+    def start(self, w: int, h: int, fps: float, with_audio: bool = True):
         d = os.path.expanduser("~/Desktop/BosonCaptures")
         os.makedirs(d, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.path = os.path.join(d, f"thermal_{ts}.mp4")
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        self._writer = cv2.VideoWriter(self.path, fourcc, max(fps,10.0), (w,h))
+        self.path        = os.path.join(d, f"thermal_{ts}.mp4")
+        self._vid_tmp    = ""
+        self._audio_tmp  = ""
+        self._writer = None
+        self._ffmpeg_proc = None
+        self._audio_proc = None
+        self._audio_recorder = None
+        self._audio_stream = None
+        self._audio_wave = None
+        self._audio_write_q = None
+        self._audio_write_thr = None
+        self._audio_backend = ""
+        self._write_q = None
+        self._write_thr = None
         self._t0 = time.time(); self._n = 0
-        print(f"  Recording → {self.path}")
+        self._video_t0 = 0.0
+        self._video_frame_t0 = 0.0
+        self._audio_t0 = 0.0
+        self._audio_actual_t0 = 0.0
+        self._dropped    = 0
+        self.has_audio   = False
+        self.target_fps  = max(float(fps), 1.0)
+        self._ffmpeg_err = ""
+        self._audio_final_args = ['-c:a', 'copy']
 
-    def write(self, frame: np.ndarray):
-        if self._writer: self._writer.write(frame); self._n += 1
+        def _start_async_writer():
+            self._write_q = queue.Queue(maxsize=32)
+            self._write_thr = threading.Thread(target=self._writer_loop, daemon=True)
+            self._write_thr.start()
 
-    def stop(self) -> Tuple[str,int,float]:
-        if self._writer: self._writer.release(); self._writer = None
+        def _open_writer(path: str):
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self._writer = cv2.VideoWriter(path, fourcc, self.target_fps, (w, h))
+            if not self._writer.isOpened():
+                self._writer = None
+                raise RuntimeError(f"VideoWriter failed to open for {path}")
+            self._video_t0 = time.perf_counter()
+            _start_async_writer()
+
+        def _open_video_ffmpeg_writer(path: str):
+            if not shutil.which('ffmpeg'):
+                raise FileNotFoundError("ffmpeg not found in PATH")
+
+            last_err = ""
+            for video_args in self._ffmpeg_video_arg_sets():
+                cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-thread_queue_size', '512',
+                    '-f', 'rawvideo',
+                    '-pix_fmt', 'bgr24',
+                    '-video_size', f'{w}x{h}',
+                    '-framerate', f'{self.target_fps:.3f}',
+                    '-i', 'pipe:0',
+                ] + video_args + [
+                    '-pix_fmt', 'yuv420p',
+                    '-an',
+                    path,
+                ]
+                proc = None
+                try:
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        bufsize=0,
+                    )
+                    time.sleep(0.25)
+                    rc = proc.poll()
+                    if rc is not None:
+                        last_err = self._read_process_error(proc)
+                        continue
+                    if proc.stdin is None:
+                        raise RuntimeError("ffmpeg stdin unavailable")
+                    self._ffmpeg_proc = proc
+                    self._video_t0 = time.perf_counter()
+                    _start_async_writer()
+                    return
+                except Exception as e:
+                    last_err = f"{e.__class__.__name__}: {e}"
+                finally:
+                    if proc is not None and proc is not self._ffmpeg_proc and proc.poll() is None:
+                        try: proc.terminate()
+                        except Exception: pass
+            raise RuntimeError(last_err or "ffmpeg video pipeline failed to start")
+
+        def _open_audio_capture(path: str):
+            if sys.platform == 'darwin' and _HAS_AVAUDIORECORDER:
+                url = Foundation.NSURL.fileURLWithPath_(path)
+                settings = {
+                    AVFoundation.AVFormatIDKey: AVFoundation.kAudioFormatMPEG4AAC,
+                    AVFoundation.AVSampleRateKey: 48000.0,
+                    AVFoundation.AVNumberOfChannelsKey: 1,
+                    AVFoundation.AVEncoderBitRateKey: 160000,
+                    AVFoundation.AVEncoderAudioQualityKey: AVFoundation.AVAudioQualityHigh,
+                }
+                rec, err = AVFoundation.AVAudioRecorder.alloc().initWithURL_settings_error_(
+                    url, settings, None)
+                if rec is None:
+                    raise RuntimeError(f"AVAudioRecorder failed to open for {path}")
+                if not rec.prepareToRecord():
+                    raise RuntimeError("AVAudioRecorder prepareToRecord failed")
+                if not rec.record():
+                    raise RuntimeError("AVAudioRecorder record() failed")
+                self._audio_recorder = rec
+                self._audio_backend = 'avaudiorecorder'
+                self._audio_t0 = time.perf_counter()
+                self._audio_actual_t0 = self._audio_t0
+                self._audio_final_args = ['-c:a', 'copy']
+                self.refresh_audio_input()
+                return
+
+            if sys.platform == 'darwin' and _HAS_SD:
+                choice = self._choose_sounddevice_input()
+                channels = max(1, min(2, int(choice['channels'])))
+                samplerate = int(choice['samplerate']) or 48000
+                try:
+                    self._audio_wave = wave.open(path, 'wb')
+                    self._audio_wave.setnchannels(channels)
+                    self._audio_wave.setsampwidth(2)
+                    self._audio_wave.setframerate(samplerate)
+                    self._audio_write_q = queue.Queue(maxsize=256)
+                    self._audio_write_thr = threading.Thread(
+                        target=self._audio_writer_loop, daemon=True)
+                    self._audio_write_thr.start()
+
+                    def _cb(indata, frames, time_info, status):
+                        try:
+                            if self._audio_write_q is not None:
+                                self._audio_write_q.put_nowait(bytes(indata))
+                        except queue.Full:
+                            pass
+
+                    self._audio_stream = sd.RawInputStream(
+                        samplerate=samplerate,
+                        blocksize=1024,
+                        channels=channels,
+                        dtype='int16',
+                        device=int(choice['index']),
+                        callback=_cb,
+                    )
+                    self._audio_stream.start()
+                except Exception:
+                    if self._audio_stream is not None:
+                        try: self._audio_stream.close()
+                        except Exception: pass
+                        self._audio_stream = None
+                    if self._audio_wave is not None:
+                        try: self._audio_wave.close()
+                        except Exception: pass
+                        self._audio_wave = None
+                    raise
+                self._audio_backend = 'sounddevice'
+                self._audio_t0 = time.perf_counter()
+                self._audio_actual_t0 = self._audio_t0
+                self._audio_final_args = ['-c:a', 'aac', '-b:a', '160k']
+                return
+
+            if not shutil.which('ffmpeg'):
+                raise FileNotFoundError("ffmpeg not found in PATH")
+
+            self.refresh_audio_input()
+            cmd = (
+                ['ffmpeg', '-y', '-loglevel', 'error', '-thread_queue_size', '512']
+                + self._audio_input_args()
+                + ['-ac', '1', '-c:a', 'aac', '-b:a', '128k', path]
+            )
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            time.sleep(0.25)
+            rc = proc.poll()
+            if rc is not None:
+                err = self._read_process_error(proc)
+                raise RuntimeError(err or f"ffmpeg audio capture exited with code {rc}")
+            self._audio_proc = proc
+            self._audio_backend = 'ffmpeg'
+            self._audio_t0 = time.perf_counter()
+            self._audio_actual_t0 = self._audio_t0
+            self._audio_final_args = ['-c:a', 'copy']
+
+        def _open_video_output(path: str):
+            try:
+                _open_video_ffmpeg_writer(path)
+            except Exception as e:
+                # Keep recording even if ffmpeg video encode is unavailable.
+                self._ffmpeg_err = f"{e.__class__.__name__}: {e}"
+                _open_writer(path)
+
+        target_video = self.path
+        if with_audio:
+            self._vid_tmp = os.path.join(d, f"thermal_{ts}_vid.mp4")
+            if sys.platform == 'darwin' and _HAS_AVAUDIORECORDER:
+                self._audio_tmp = os.path.join(d, f"thermal_{ts}_audio.m4a")
+            elif sys.platform == 'darwin' and _HAS_SD:
+                self._audio_tmp = os.path.join(d, f"thermal_{ts}_audio.wav")
+            else:
+                self._audio_tmp = os.path.join(d, f"thermal_{ts}_audio.m4a")
+            target_video = self._vid_tmp
+            try:
+                _open_audio_capture(self._audio_tmp)
+                self.has_audio = True
+            except Exception as e:
+                hint = ""
+                msg = str(e)
+                if sys.platform == 'darwin' and 'permission' in msg.lower():
+                    hint = " — grant Microphone access to Terminal in System Settings"
+                print(f"  Audio unavailable ({e.__class__.__name__}: {e}){hint} — recording video only")
+
+        _open_video_output(target_video)
+        self._start_sleep_guard()
+
+        if not with_audio:
+            print(f"  Recording → {self.path}  @{self.target_fps:.0f}fps")
+            return
+        audio_tag = ""
+        if self.has_audio:
+            label = self.audio_input_label()
+            audio_tag = f" + audio [{label}]" if label else " + audio"
+        print(f"  Recording → {self.path}{audio_tag}  @{self.target_fps:.0f}fps")
+
+    def _writer_loop(self):
+        while self._write_q is not None:
+            item = self._write_q.get()
+            if item is None:
+                break
+            frame, frame_time = item
+            try:
+                if frame_time and self._video_frame_t0 == 0.0:
+                    self._video_frame_t0 = frame_time
+                if self._ffmpeg_proc is not None:
+                    if self._ffmpeg_proc.stdin is None:
+                        raise BrokenPipeError("ffmpeg stdin closed")
+                    self._ffmpeg_proc.stdin.write(memoryview(frame).cast('B'))
+                elif self._writer is not None:
+                    self._writer.write(frame)
+                else:
+                    break
+                self._n += 1
+            except Exception as e:
+                self._dropped += 1
+                if self._ffmpeg_proc is not None and not self._ffmpeg_err:
+                    self._ffmpeg_err = f"{e.__class__.__name__}: {e}"
+                break
+
+    def write(self, frame: np.ndarray, copy_frame: bool = True,
+              frame_time: float = 0.0):
+        if self._write_q is not None and self.recording:
+            queued = frame.copy() if copy_frame else frame
+            if not queued.flags.c_contiguous:
+                queued = np.ascontiguousarray(queued)
+            try:
+                self._write_q.put_nowait((queued, frame_time))
+            except queue.Full:
+                self._dropped += 1
+
+    def stop(self) -> Tuple[str, int, float]:
         dur = time.time() - self._t0
-        print(f"  Stopped — {self._n} frames, {dur:.1f}s → {self.path}")
+        sync_error = ""
+        audio_ok = self.has_audio
+
+        if self._write_q is not None:
+            self._write_q.put(None)
+        if self._write_thr is not None:
+            self._write_thr.join(timeout=30)
+            self._write_thr = None
+        self._write_q = None
+
+        if self._writer:
+            self._writer.release(); self._writer = None
+
+        ffmpeg_proc = self._ffmpeg_proc
+        self._ffmpeg_proc = None
+        if ffmpeg_proc is not None:
+            try:
+                if ffmpeg_proc.stdin is not None:
+                    ffmpeg_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                rc = ffmpeg_proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                try: ffmpeg_proc.terminate()
+                except Exception: pass
+                try: rc = ffmpeg_proc.wait(timeout=5)
+                except Exception: rc = -1
+            err = self._read_process_error(ffmpeg_proc)
+            if err and not self._ffmpeg_err:
+                self._ffmpeg_err = err
+            if rc != 0:
+                sync_error = self._ffmpeg_err or f"ffmpeg exited with code {rc}"
+                audio_ok = False
+
+        if self._audio_backend == 'avaudiorecorder':
+            try:
+                if self._audio_recorder is not None and self._audio_t0:
+                    wall_elapsed = time.perf_counter() - self._audio_t0
+                    recorded_elapsed = float(self._audio_recorder.currentTime())
+                    startup_lag = max(0.0, wall_elapsed - recorded_elapsed)
+                    self._audio_actual_t0 = self._audio_t0 + startup_lag
+                if self._audio_recorder is not None:
+                    self._audio_recorder.stop()
+                # Give AVAudioRecorder a moment to finalize container metadata.
+                time.sleep(0.1)
+            except Exception as e:
+                sync_error = f"{e.__class__.__name__}: {e}"
+                audio_ok = False
+            self._audio_recorder = None
+        elif self._audio_backend == 'sounddevice':
+            try:
+                if self._audio_stream is not None:
+                    self._audio_stream.stop()
+                    self._audio_stream.close()
+            except Exception as e:
+                sync_error = f"{e.__class__.__name__}: {e}"
+                audio_ok = False
+            self._audio_stream = None
+            if self._audio_write_q is not None:
+                self._audio_write_q.put(None)
+            if self._audio_write_thr is not None:
+                self._audio_write_thr.join(timeout=10)
+                self._audio_write_thr = None
+            self._audio_write_q = None
+            if self._audio_wave is not None:
+                try:
+                    self._audio_wave.close()
+                except Exception as e:
+                    sync_error = f"{e.__class__.__name__}: {e}"
+                    audio_ok = False
+                self._audio_wave = None
+        else:
+            audio_proc = self._audio_proc
+            self._audio_proc = None
+            if audio_proc is not None:
+                try:
+                    if audio_proc.stdin is not None:
+                        audio_proc.stdin.write(b'q')
+                        audio_proc.stdin.flush()
+                        audio_proc.stdin.close()
+                    rc = audio_proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    try: audio_proc.terminate()
+                    except Exception: pass
+                    try: rc = audio_proc.wait(timeout=5)
+                    except Exception: rc = -1
+                except Exception:
+                    try: audio_proc.terminate()
+                    except Exception: pass
+                    try: rc = audio_proc.wait(timeout=5)
+                    except Exception: rc = -1
+                err = self._read_process_error(audio_proc)
+                if rc != 0:
+                    sync_error = err or f"audio capture exited with code {rc}"
+                    audio_ok = False
+            self._audio_proc = None
+        self._audio_backend = ""
+
+        video_path = self._vid_tmp if self._vid_tmp else self.path
+        video_ok = os.path.exists(video_path)
+        audio_ok = audio_ok and bool(self._audio_tmp) and os.path.exists(self._audio_tmp)
+
+        if video_ok and video_path != self.path and not audio_ok:
+            shutil.move(video_path, self.path)
+            video_path = self.path
+
+        if video_ok and audio_ok:
+            video_start = self._video_frame_t0 or self._video_t0
+            audio_start = self._audio_actual_t0 or self._audio_t0
+            offset = audio_start - video_start if video_start and audio_start else 0.0
+            if offset > 0:
+                # Audio started after the first captured video frame.  Advance
+                # the audio timestamps so the delayed audio content lines up
+                # with the already-recorded video instead of keeping dead air.
+                mux_inputs = ['-i', video_path, '-itsoffset', f'{-offset:.6f}', '-i', self._audio_tmp]
+            elif offset < 0:
+                mux_inputs = ['-i', video_path, '-ss', f'{-offset:.6f}', '-i', self._audio_tmp]
+            else:
+                mux_inputs = ['-i', video_path, '-i', self._audio_tmp]
+            try:
+                r = subprocess.run(
+                    ['ffmpeg', '-y'] + mux_inputs + [
+                        '-map', '0:v:0',
+                        '-map', '1:a:0',
+                        '-c:v', 'copy',
+                    ] + self._audio_final_args + [
+                        '-movflags', '+faststart',
+                        '-shortest',
+                        self.path,
+                    ],
+                    capture_output=True, timeout=120
+                )
+                if r.returncode == 0:
+                    if video_path != self.path and os.path.exists(video_path):
+                        os.remove(video_path)
+                    if self._audio_tmp and os.path.exists(self._audio_tmp):
+                        os.remove(self._audio_tmp)
+                else:
+                    sync_error = r.stderr.decode(errors='replace')[-300:] or "ffmpeg mux failed"
+                    audio_ok = False
+            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                sync_error = f"{e.__class__.__name__}: {e}"
+                audio_ok = False
+            if not audio_ok:
+                if video_path != self.path and os.path.exists(video_path):
+                    shutil.move(video_path, self.path)
+
+        drop_note = f", dropped {self._dropped}" if self._dropped else ""
+        if sync_error and not os.path.exists(self.path):
+            print(f"  Recording failed (audio/video combine error: {sync_error})")
+        elif audio_ok:
+            print(f"  Saved — {self._n} frames, {dur:.1f}s{drop_note}, muxed audio → {self.path}")
+        elif self.has_audio and sync_error:
+            extra = f" (raw audio kept at {self._audio_tmp})" if self._audio_tmp and os.path.exists(self._audio_tmp) else ""
+            print(f"  Saved (audio mux failed: {sync_error}) — "
+                  f"{self._n} frames, {dur:.1f}s{drop_note} → {self.path}{extra}")
+        else:
+            print(f"  Saved — {self._n} frames, {dur:.1f}s{drop_note} → {self.path}")
+        self._stop_sleep_guard()
         return self.path, self._n, dur
 
     @property
     def elapsed(self) -> float:
-        return time.time()-self._t0 if self.recording else 0.0
+        return time.time() - self._t0 if self.recording else 0.0
 
 # ── Threaded grabber ──────────────────────────────────────────────────────────
 
 class FrameGrabber:
-    """Reads camera on a background thread — UI loop never blocks on cap.read().
-    Tracks a 'new' flag so the main loop only processes each camera frame once,
-    giving accurate FPS measurement and no wasted NUC computation on duplicates."""
+    """Reads camera on a background thread.
+
+    Live preview can pull only the newest frame for low latency, while the
+    recorder can drain every pending frame so short UI stalls do not silently
+    drop sensor cadence.
+    """
     def __init__(self, cap):
-        self._cap   = cap
-        self._frame : Optional[np.ndarray] = None
-        self._new   = False
-        self._lock  = threading.Lock()
-        self._alive = True
+        self._cap    = cap
+        self._frames = deque(maxlen=32)
+        self._lock   = threading.Lock()
+        self._alive  = True
         self.cam_fps: float = 0.0   # delivery rate measured in background thread
         threading.Thread(target=self._loop, daemon=True).start()
 
@@ -394,21 +1408,32 @@ class FrameGrabber:
         while self._alive:
             ret, f = self._cap.read()
             if ret and f is not None:
+                ft = time.perf_counter()
                 with self._lock:
-                    self._frame = f
-                    self._new   = True
+                    self._frames.append((ft, f))
                 cn += 1
                 t1 = time.perf_counter()
                 if t1 - t0 >= 1.0:
                     self.cam_fps = cn / (t1 - t0)
                     cn = 0; t0 = t1
 
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        """Returns (True, frame) only when a NEW frame has arrived since last call."""
+    def read_latest(self) -> Tuple[bool, Optional[np.ndarray], float]:
+        """Returns only the newest pending frame and drops older ones."""
         with self._lock:
-            if not self._new or self._frame is None: return False, None
-            self._new = False
-            return True, self._frame   # caller must not modify in-place
+            if not self._frames:
+                return False, None, 0.0
+            frame_t, frame = self._frames[-1]
+            self._frames.clear()
+            return True, frame, frame_t
+
+    def read_all(self) -> List[Tuple[float, np.ndarray]]:
+        """Returns all pending frames in capture order."""
+        with self._lock:
+            if not self._frames:
+                return []
+            frames = list(self._frames)
+            self._frames.clear()
+            return frames
 
     def release(self):
         self._alive = False; self._cap.release()
@@ -418,23 +1443,57 @@ class FrameGrabber:
 def try_force_60fps():
     try:
         import AVFoundation as avf, CoreMedia as cm
+        boson_sizes = {
+            (s.w, s.h)
+            for s in SENSOR_PROFILES
+            if "Boson" in s.name and s.fps >= 60
+        }
         for dev in avf.AVCaptureDevice.devicesWithMediaType_(avf.AVMediaTypeVideo):
             name = str(dev.localizedName())
             if "FLIR" not in name and "Boson" not in name: continue
             best = None
+            best_range = None
+            best_rate = 0.0
+            best_area = -1
             for fmt in dev.formats():
                 d = cm.CMVideoFormatDescriptionGetDimensions(fmt.formatDescription())
-                if d.width == CAM_W and d.height == CAM_H:
-                    for r in fmt.videoSupportedFrameRateRanges():
-                        if r.maxFrameRate() >= 60: best=fmt; break
-                if best: break
-            if not best: return
-            if dev.lockForConfiguration_(None): return
-            dev.setActiveFormat_(best)
-            t = cm.CMTimeMake(1,60)
-            dev.setActiveVideoMinFrameDuration_(t)
-            dev.setActiveVideoMaxFrameDuration_(t)
-            dev.unlockForConfiguration()
+                dims = (int(d.width), int(d.height))
+                if dims not in boson_sizes:
+                    continue
+                fmt_best_range = None
+                max_rate = 0.0
+                for r in fmt.videoSupportedFrameRateRanges():
+                    rate = float(r.maxFrameRate())
+                    if rate > max_rate:
+                        max_rate = rate
+                        fmt_best_range = r
+                if max_rate < 60.0:
+                    continue
+                area = dims[0] * dims[1]
+                if best is None or (area, max_rate) > (best_area, best_rate):
+                    best = fmt
+                    best_range = fmt_best_range
+                    best_rate = max_rate
+                    best_area = area
+            if best is None:
+                continue
+            locked = dev.lockForConfiguration_(None)
+            if isinstance(locked, tuple):
+                locked = locked[0]
+            if not locked:
+                continue
+            try:
+                dev.setActiveFormat_(best)
+                if best_range is not None:
+                    try:
+                        min_dur = best_range.minFrameDuration()
+                        max_dur = best_range.maxFrameDuration()
+                        dev.setActiveVideoMinFrameDuration_(min_dur)
+                        dev.setActiveVideoMaxFrameDuration_(max_dur)
+                    except Exception:
+                        pass
+            finally:
+                dev.unlockForConfiguration()
             print(f"  PyObjC: 60fps set on '{name}'")
     except Exception: pass
 
@@ -455,9 +1514,127 @@ smoother = TemporalSmoother()
 recorder = VideoRecorder()
 denoise  = True
 
+# Probe microphone availability once at startup.
+# Only takes ~400 ms and lets us hide the audio toggle entirely on machines
+# where audio is unavailable (no backend, no mic, or macOS permission denied).
+print("  Probing microphone…", end=" ", flush=True)
+_AUDIO_AVAILABLE: bool = VideoRecorder.probe_audio()
+if _AUDIO_AVAILABLE:
+    _audio_label = VideoRecorder.audio_input_label()
+    print(f"available ({_audio_label})" if _audio_label else "available")
+else:
+    print("unavailable (video-only)")
+record_audio: bool = _AUDIO_AVAILABLE   # user-toggled; only relevant when True
+
+# Persistent flat arrays for thermal_core (allocated lazily after sensor detected)
+_tc_nuc_offset : Optional[np.ndarray] = None   # float32, shape (CAM_H*CAM_W,)
+_tc_prev_frame : Optional[np.ndarray] = None   # float32, shape (CAM_H*CAM_W,)
+_tc_out_buf    : Optional[np.ndarray] = None   # uint8,   shape (IH*IW*3,) — Rust writes here
+
+# ── Runtime dead-pixel discovery ───────────────────────────────────────────────
+# Every _RTBP_INTERVAL frames we run a quick spatial scan.  A pixel must be
+# flagged suspicious in _RTBP_CONFIRM separate scans (spread over many seconds)
+# before it is confirmed as bad.  Already-confirmed runtime pixels must then
+# survive _RTBP_RECOVER clearly-healthy scans before they are removed again.
+_RTBP_INTERVAL = 180   # frames between scans  (~3 s at 60 fps)
+_RTBP_CONFIRM  = 4     # suspicious hits needed (~12 s of evidence minimum)
+_RTBP_RECOVER  = 8     # clearly-healthy hits needed (~24 s) to forgive runtime px
+_rtbp_suspicion: Optional[np.ndarray] = None   # int16 (CAM_H, CAM_W) confidence
+_rtbp_recovery : Optional[np.ndarray] = None   # int16 (CAM_H, CAM_W) healthy-hit streak
+_rtbp_frame_ctr: int   = 0
+
+def _rtbp_update(gray: np.ndarray) -> None:
+    """Runtime bad-pixel scan. Called every frame; expensive work runs only
+    every _RTBP_INTERVAL frames so the amortised per-frame cost is trivial.
+
+    Algorithm:
+      1. Compute local 5×5 neighbourhood mean of the raw gray frame.
+      2. A pixel is 'suspicious' only if it is both a strong global outlier
+         and much worse than the local deviation field around it.  That keeps
+         real scene edges from being misidentified as dead pixels.
+      3. Suspicion decays when a candidate stops looking isolated, so good
+         pixels do not accumulate toward confirmation forever.
+      4. Confirmed runtime pixels are periodically revalidated and removed
+         after enough clearly-healthy scans.
+    """
+    global _rtbp_suspicion, _rtbp_recovery, _rtbp_frame_ctr
+    _rtbp_frame_ctr += 1
+    if _rtbp_frame_ctr % _RTBP_INTERVAL != 0:
+        return
+
+    if _rtbp_suspicion is None or _rtbp_suspicion.shape != (CAM_H, CAM_W):
+        _rtbp_suspicion = np.zeros((CAM_H, CAM_W), np.int16)
+    if _rtbp_recovery is None or _rtbp_recovery.shape != (CAM_H, CAM_W):
+        _rtbp_recovery = np.zeros((CAM_H, CAM_W), np.int16)
+
+    f32     = gray.astype(np.float32)
+    nbr     = cv2.blur(f32, (5, 5))
+    dev     = f32 - nbr                          # signed deviation from neighbours
+    abs_dev = np.abs(dev)
+    gstd    = float(abs_dev.std())
+    if gstd < 0.5:                               # featureless / saturated frame
+        return
+
+    # Dead pixels are isolated outliers.  Real scene edges often have large
+    # deviations too, but their neighbours are also "busy".  Require the pixel
+    # to beat both the global scene threshold and the local deviation field.
+    local_abs = cv2.blur(abs_dev, (5, 5))
+    suspicious = (
+        (abs_dev > gstd * 6.0) &
+        (abs_dev > 4.0) &
+        (abs_dev > (local_abs * 3.0 + 2.0))
+    )
+    clearly_normal = abs_dev < max(gstd * 2.0, 2.5)
+
+    calib_bad = flatf.calibration_mask()
+    runtime_bad = flatf.runtime_mask if flatf.runtime_mask is not None else np.zeros_like(calib_bad)
+    candidates = ~calib_bad
+    suspicious &= candidates
+    clearly_normal &= candidates
+
+    new_candidates = candidates & ~runtime_bad
+    if new_candidates.any():
+        pos = new_candidates & suspicious
+        neg = new_candidates & ~suspicious
+        if pos.any():
+            _rtbp_suspicion[pos] = np.minimum(_rtbp_suspicion[pos] + 1, _RTBP_CONFIRM)
+        if neg.any():
+            _rtbp_suspicion[neg] = np.maximum(_rtbp_suspicion[neg] - 1, 0)
+
+    runtime_candidates = candidates & runtime_bad
+    if runtime_candidates.any():
+        still_bad = runtime_candidates & suspicious
+        healthy   = runtime_candidates & clearly_normal
+        uncertain = runtime_candidates & ~suspicious & ~clearly_normal
+        if still_bad.any():
+            _rtbp_recovery[still_bad] = 0
+        if healthy.any():
+            _rtbp_recovery[healthy] = np.minimum(_rtbp_recovery[healthy] + 1, _RTBP_RECOVER)
+        if uncertain.any():
+            _rtbp_recovery[uncertain] = np.maximum(_rtbp_recovery[uncertain] - 1, 0)
+
+    newly_confirmed = new_candidates & (_rtbp_suspicion >= _RTBP_CONFIRM)
+    if newly_confirmed.any():
+        n_added = flatf.add_runtime_bad(newly_confirmed)
+        if n_added:
+            _rtbp_suspicion[newly_confirmed] = 0
+            _rtbp_recovery[newly_confirmed] = 0
+            print(f"  Runtime scan: +{n_added} bad px confirmed  "
+                  f"(total {flatf.n_bad})")
+
+    newly_recovered = runtime_candidates & (_rtbp_recovery >= _RTBP_RECOVER)
+    if newly_recovered.any():
+        n_removed = flatf.remove_runtime_bad(newly_recovered)
+        if n_removed:
+            _rtbp_suspicion[newly_recovered] = 0
+            _rtbp_recovery[newly_recovered] = 0
+            print(f"  Runtime scan: -{n_removed} runtime px removed  "
+                  f"(total {flatf.n_bad})")
+
 status_msg   = "Ready"
 nuc_auto_t   = 0.0
 mouse_x = mouse_y = 0
+_last_saved_path = ""
 
 # Sidebar click hitboxes — cleared and rebuilt each frame
 _hitboxes: List[Tuple[int,int,int,int,object]] = []  # (abs_x,y,w,h,action)
@@ -479,6 +1656,13 @@ def _prof_start():
 
 # Camera FPS (set by FrameGrabber background thread, read in sidebar)
 cam_fps: float = 0.0
+
+def current_record_fps() -> float:
+    if cam_fps > 0:
+        return cam_fps
+    if sensor and sensor.fps > 0:
+        return float(sensor.fps)
+    return max(fps_current, 1.0)
 
 # Sidebar frame cache — rebuild at most every _SB_EVERY frames
 _SB_EVERY  = 3
@@ -541,6 +1725,57 @@ def mouse_cb(event, x, y, flags, _):
         elif event == cv2.EVENT_RBUTTONDOWN and markers:
             markers.pop(min(range(len(markers)),
                             key=lambda i:abs(markers[i]["x"]-cx)+abs(markers[i]["y"]-cy)))
+
+def _open_path(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        if sys.platform == 'darwin':
+            subprocess.Popen(
+                ['/usr/bin/open', path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif sys.platform == 'win32':
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            opener = shutil.which('xdg-open')
+            if not opener:
+                return False
+            subprocess.Popen(
+                [opener, path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return True
+    except Exception:
+        return False
+
+def _reveal_path(path: str) -> bool:
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        if sys.platform == 'darwin':
+            subprocess.Popen(
+                ['/usr/bin/open', '-R', path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        elif sys.platform == 'win32':
+            subprocess.Popen(['explorer', f'/select,{os.path.normpath(path)}'])
+        else:
+            folder = os.path.dirname(path) or '.'
+            opener = shutil.which('xdg-open')
+            if not opener:
+                return False
+            subprocess.Popen(
+                [opener, folder],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        return True
+    except Exception:
+        return False
 
 # ── Drawing helpers ───────────────────────────────────────────────────────────
 
@@ -622,7 +1857,9 @@ def draw_sidebar(fps: float) -> np.ndarray:
     cfps = f"cam {cam_fps:.0f}/" if cam_fps > 0 else ""
     line2 = f"{cfps}{fps:.0f} fps  {CAM_W}x{CAM_H}"
     if frozen:             line2 += "  [FROZEN]";               fps_col = C_FROST
-    if recorder.recording: line2 += f"  [REC] {recorder.elapsed:.0f}s"; fps_col = C_REC
+    if recorder.recording:
+        audio_tag = "+MIC" if recorder.has_audio else ""
+        line2 += f"  [REC{audio_tag}] {recorder.elapsed:.0f}s"; fps_col = C_REC
     put(sb, line2, X, 33, fps_col, 0.35)
     y = 52
 
@@ -667,6 +1904,65 @@ def draw_sidebar(fps: float) -> np.ndarray:
     _abtn(2, "SAVE", False, C_ACCENT, _action_save_snapshot)
 
     y += ABH + 8
+
+    def _mini_btn(bx: int, by: int, bw: int, bh: int, label: str, action,
+                  accent=C_ACCENT) -> None:
+        hov = hovering(bx, by, bw, bh)
+        bg  = tuple(min(255, c + 24) for c in accent) if hov else tuple(int(c * 0.22) for c in accent)
+        bd  = accent if hov else BORDER
+        cv2.rectangle(sb, (bx, by), (bx+bw, by+bh), bg, -1)
+        cv2.rectangle(sb, (bx, by), (bx+bw, by+bh), bd, 1)
+        tw = len(label) * 6
+        put(sb, label, bx + max(5, (bw - tw) // 2), by + bh - 7, C_BRIGHT, 0.31)
+        reg_hb(bx, by, bw, bh, action)
+
+    if recorder.recording:
+        awake_col = C_GREEN if recorder.keeping_screen_awake else C_ORANGE
+        awake_msg = ("Display kept awake while recording"
+                     if recorder.keeping_screen_awake
+                     else "Recording active")
+        put(sb, awake_msg, X+2, y, awake_col, 0.28)
+        y += 11
+
+    # Mic-audio toggle — only drawn when a working microphone was detected at startup
+    if _AUDIO_AVAILABLE:
+        y = toggle_row(sb, X, y, "Record with mic", "M", record_audio,
+                       _action_toggle_record_audio,
+                       C_ORANGE, "OFF")
+        label = VideoRecorder.audio_input_label()
+        if label and len(label) > 32:
+            label = label[:29] + "..."
+        if label:
+            put(sb, label, X+2, y, C_MED, 0.27); y += 11
+        if recorder.recording:
+            put(sb, "Stop recording to change", X+2, y, C_DIM, 0.27)
+        else:
+            if sys.platform == 'darwin' and _HAS_AVAUDIORECORDER:
+                put(sb, "Use macOS Sound settings to change input", X+2, y, C_DIM, 0.27)
+            else:
+                put(sb, "A = change input  |  Mute = video only", X+2, y, C_DIM, 0.27)
+        y += 11
+
+    if _last_saved_path:
+        last_exists = os.path.exists(_last_saved_path)
+        hline(sb, y); y += 8
+        y = section(sb, X, y, "LAST SAVE", C_BLUE if last_exists else C_ORANGE)
+        card(sb, X, y, BW, 58, fill=(20, 24, 30) if last_exists else (28, 20, 20))
+        name = os.path.basename(_last_saved_path)
+        if len(name) > 34:
+            name = name[:31] + "..."
+        put(sb, name, X+6, y+14, C_BRIGHT if last_exists else C_ORANGE, 0.32)
+        if last_exists:
+            put(sb, "Click name or OPEN to launch file", X+6, y+27, C_DIM, 0.27)
+            reg_hb(X, y, BW, 30, _action_open_last_saved)
+            btn_y = y + 34
+            btn_w = (BW - 6) // 2
+            _mini_btn(X, btn_y, btn_w, 18, "OPEN", _action_open_last_saved, C_GREEN)
+            _mini_btn(X + btn_w + 6, btn_y, btn_w, 18, "REVEAL", _action_reveal_last_saved, C_BLUE)
+        else:
+            put(sb, "File moved or deleted", X+6, y+27, C_DIM, 0.27)
+        y += 64
+
     hline(sb, y); y += 8
 
     # ── Histogram ─────────────────────────────────────────────────────────────
@@ -720,48 +2016,70 @@ def draw_sidebar(fps: float) -> np.ndarray:
         put(sb, vname, tx, y+tab_h-7, tc, 0.30)
         reg_hb(bx, y, tab_w-2, tab_h, lambda v=vi: _action_set_view(v))
     y += tab_h + 4
-    desc = {0: "Corrected live feed",
-            1: "Flat-field noise map" if flatf.correction is not None else "No calibration yet",
-            2: "Raw uncorrected feed"}[view_mode]
-    dc = C_ORANGE if (view_mode == 1 and flatf.correction is None) else C_DIM
-    put(sb, desc, X, y, dc, 0.29)
-    y += 14
+    desc, dc = {
+        0: ("Flat-field + motion-NUC corrections applied",                    C_DIM),
+        1: ("Per-pixel offset map  (red=stuck · cyan=hot/cold)"
+            if flatf.correction is not None
+            else "Not calibrated yet — press F to calibrate",
+            C_ORANGE if flatf.correction is None else C_DIM),
+        2: ("Raw sensor output — no corrections applied",                     C_DIM),
+    }[view_mode]
+    put(sb, desc, X, y, dc, 0.27)
+    y += 13
 
     # ── Flat-field NUC ────────────────────────────────────────────────────────
     hline(sb, y); y += 8
     calib_col = C_ORANGE if flatf.calibrating else (C_GREEN if flatf.enabled else C_RED)
-    y = section(sb, X, y, "FLAT-FIELD NUC  (F)", calib_col)
+    y = section(sb, X, y, "FLAT-FIELD NUC  (F / Shift+F)", calib_col)
 
     if flatf.calibrating:
-        put(sb, "CAPTURING - hold still", X, y, C_ORANGE, 0.36); y += 16
+        mode_label = "FULL" if flatf._mode == 'full' else "COLOUR"
+        put(sb, f"CAPTURING… [{mode_label}]", X, y, C_ORANGE, 0.36); y += 16
         pw = BW
         cv2.rectangle(sb, (X, y), (X+pw,              y+14), (26, 26, 26), -1)
         cv2.rectangle(sb, (X, y), (X+int(pw*flatf.progress), y+14), (0,160,55), -1)
         cv2.rectangle(sb, (X, y), (X+pw,              y+14), BORDER, 1)
         put(sb, f"{flatf.frames_captured}/{flatf.N}", X+pw//2-16, y+11, C_BRIGHT, 0.32)
         y += 20
-        put(sb, "Point at wall / sky / lens cap", X, y, C_DIM, 0.30)
-        y += 14
+        if flatf._mode == 'full':
+            put(sb, "Slowly slide over wall / sky", X, y, C_DIM, 0.30); y += 13
+        else:
+            put(sb, "Hold still or slide — colour only", X, y, C_DIM, 0.30); y += 13
     elif flatf.enabled:
-        card(sb, X, y, BW, 38, fill=(18, 24, 18))
+        # breakdown: stuck + hot/cold + runtime
+        stuck_s   = f"{flatf.n_stuck} stuck"
+        outlier_s = f"{flatf.n_outlier} hot/cold"
+        parts = [stuck_s, outlier_s]
+        if flatf.n_runtime > 0:
+            parts.append(f"+{flatf.n_runtime} runtime")
+        detail = "  ".join(parts)
+        card(sb, X, y, BW, 46, fill=(18, 24, 18))
         cv2.circle(sb, (X+8, y+10), 4, C_GREEN, -1, cv2.LINE_AA)
-        put(sb, "Calibrated",                          X+18, y+14, C_GREEN, 0.36)
-        put(sb, f"{flatf.n_bad} bad pixels corrected", X+6,  y+27, C_DIM,   0.29)
-        y += 42
-        put(sb, "N > NUC Map  |  F = recalibrate", X, y, C_DIM, 0.28)
-        y += 14
+        put(sb, "Calibrated",              X+18, y+14, C_GREEN, 0.36)
+        put(sb, f"{flatf.n_bad} bad px corrected", X+6, y+27, C_DIM, 0.30)
+        put(sb, detail,                    X+6,  y+39, C_DIM,   0.27)
+        y += 50
+        put(sb, "N = NUC Map  |  F = colour  Shift+F = full", X, y, C_DIM, 0.27)
+        y += 13
+        rt_col = C_ACCENT if flatf.n_runtime > 0 else C_DIM
+        put(sb, "Runtime scan: active", X, y, rt_col, 0.27)
+        y += 13
     else:
-        card(sb, X, y, BW, 52, fill=(20, 18, 18))
-        put(sb, "Not calibrated",                X+6, y+13, C_DIM,    0.34)
-        put(sb, "1. Point at blank wall or sky",  X+6, y+27, C_MED,    0.30)
-        put(sb, "2. Press F - hold 2 seconds",     X+6, y+40, C_ORANGE, 0.32)
-        y += 56
+        card(sb, X, y, BW, 73, fill=(20, 18, 18))
+        put(sb, "Not calibrated",                         X+6, y+13, C_DIM,    0.34)
+        put(sb, "1. Point at blank wall or sky",           X+6, y+27, C_MED,    0.30)
+        put(sb, "2. Slowly slide camera  (or hold still)", X+6, y+41, C_MED,    0.30)
+        put(sb, "F = colour only  (~1 s)",                 X+6, y+55, C_ORANGE, 0.30)
+        put(sb, "Shift+F = full detection  (~4 s)",        X+6, y+68, C_ACCENT, 0.29)
+        y += 77
 
     # ── Corrections ───────────────────────────────────────────────────────────
     hline(sb, y); y += 8
     y = section(sb, X, y, "CORRECTIONS")
     y = toggle_row(sb, X, y, "Motion NUC",      "D", denoise,          _action_toggle_denoise)
+    put(sb, "Removes per-pixel fixed-pattern sensor noise", X+2, y, C_DIM, 0.27); y += 11
     y = toggle_row(sb, X, y, "Temporal smooth",  "T", smoother.enabled, _action_toggle_temporal)
+    put(sb, "Frame-blend to reduce shot noise (adds motion blur)", X+2, y, C_DIM, 0.27); y += 11
     y = toggle_row(sb, X, y, "Flip horizontal",  "H", flip_h,           _action_toggle_fliph,  C_BLUE, "OFF")
     y = toggle_row(sb, X, y, "Flip vertical",    "V", flip_v,           _action_toggle_flipv,  C_BLUE, "OFF")
 
@@ -793,7 +2111,8 @@ def draw_sidebar(fps: float) -> np.ndarray:
     bot = IH - 44
     hline(sb, bot)
     put(sb, "S = snapshot    Q / Esc = quit",         X, bot+15, C_DIM, 0.31)
-    put(sb, "Recordings > ~/Desktop/BosonCaptures/",  X, bot+29, C_DIM, 0.27)
+    last_hint = "OPEN LAST after save" if _last_saved_path else "Recordings > ~/Desktop/BosonCaptures/"
+    put(sb, last_hint,  X, bot+29, C_DIM, 0.27)
 
     return sb
 
@@ -830,35 +2149,84 @@ def _action_toggle_flipv():
     status_msg = f"Flip V {'ON' if flip_v else 'OFF'}"
 
 def _action_toggle_record():
-    global status_msg
+    global status_msg, _last_saved_path
     if recorder.recording:
         path, n, dur = recorder.stop()
-        status_msg = f"Saved {n} frames ({dur:.1f}s)  {os.path.basename(path)}"
+        _last_saved_path = path if path and os.path.exists(path) else ""
+        if _last_saved_path:
+            status_msg = (f"Saved {n} frames ({dur:.1f}s)  "
+                          f"{os.path.basename(path)}  — click OPEN LAST")
+        else:
+            status_msg = f"Saved {n} frames ({dur:.1f}s)  {os.path.basename(path)}"
     else:
-        recorder.start(IW, IH, fps_current)
-        status_msg = f"Recording: {os.path.basename(recorder.path)}"
+        recorder.start(IW, IH, current_record_fps(), with_audio=record_audio)
+        audio_note = " + audio" if record_audio and _AUDIO_AVAILABLE else ""
+        status_msg = f"Recording{audio_note}: {os.path.basename(recorder.path)}"
+
+def _action_toggle_record_audio():
+    global record_audio, status_msg
+    if recorder.recording: return   # don't switch mid-recording
+    record_audio = not record_audio
+    status_msg = "Recording audio: ON" if record_audio else "Recording audio: OFF"
+
+def _action_cycle_audio_input():
+    global status_msg
+    if recorder.recording:
+        return
+    label = VideoRecorder.cycle_audio_input()
+    if label:
+        status_msg = f"Mic input: {label}"
+    elif sys.platform == 'darwin' and _HAS_AVAUDIORECORDER:
+        status_msg = "Change the default mic in macOS Sound settings"
 
 def _action_freeze():
     global frozen, status_msg
     frozen = not frozen
     status_msg = "Frame frozen - SPACE to resume" if frozen else "Resumed"
 
-def _action_start_calibrate():
-    global status_msg
+def _action_start_calibrate(mode: str = 'offset'):
+    global status_msg, _rtbp_suspicion, _rtbp_recovery, _rtbp_frame_ctr
     if not flatf.calibrating:
-        flatf.start(); nuc.reset()
+        _rtbp_suspicion = None
+        _rtbp_recovery = None
+        _rtbp_frame_ctr = 0
+        flatf.start(mode); nuc.reset()
         _action_set_view(0)
-        status_msg = "Flat-field calibration started - aim at uniform surface"
+        if mode == 'full':
+            status_msg = "Full calibration — slide slowly over wall / sky"
+        else:
+            status_msg = "Colour calibration — hold still or slide over surface"
 
 def _action_save_snapshot():
-    global status_msg
+    global status_msg, _last_saved_path
     d  = os.path.expanduser("~/Desktop/BosonCaptures")
     os.makedirs(d, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     fn = os.path.join(d, f"thermal_{ts}.png")
     if _canvas is not None:
         cv2.imwrite(fn, _canvas)
-        status_msg = f"Saved: {os.path.basename(fn)}"
+        _last_saved_path = fn if os.path.exists(fn) else ""
+        status_msg = f"Saved: {os.path.basename(fn)}  — click OPEN LAST"
+
+def _action_open_last_saved():
+    global status_msg
+    if not _last_saved_path or not os.path.exists(_last_saved_path):
+        status_msg = "Last saved file is missing"
+        return
+    if _open_path(_last_saved_path):
+        status_msg = f"Opened: {os.path.basename(_last_saved_path)}"
+    else:
+        status_msg = f"Could not open: {os.path.basename(_last_saved_path)}"
+
+def _action_reveal_last_saved():
+    global status_msg
+    if not _last_saved_path or not os.path.exists(_last_saved_path):
+        status_msg = "Last saved file is missing"
+        return
+    if _reveal_path(_last_saved_path):
+        status_msg = f"Revealed: {os.path.basename(_last_saved_path)}"
+    else:
+        status_msg = f"Could not reveal: {os.path.basename(_last_saved_path)}"
 
 # ── Camera image builder ──────────────────────────────────────────────────────
 
@@ -876,47 +2244,117 @@ def build_cam_image(f32_corr: np.ndarray, f32_raw: np.ndarray) -> np.ndarray:
         src = colorize(n, cm_idx)
     return cv2.resize(src,(IW,IH),interpolation=cv2.INTER_NEAREST)
 
+def decorate_camera_image(base_img: np.ndarray, copy_frame: bool = False) -> np.ndarray:
+    need_markers = bool(markers) and view_mode != 1 and norm8 is not None
+    img = base_img.copy() if copy_frame or need_markers else base_img
+
+    if need_markers:
+        for i, m in enumerate(markers):
+            cx = int((CAM_W-1-m["x"] if flip_h else m["x"])*SCALE)
+            cy = int((CAM_H-1-m["y"] if flip_v else m["y"])*SCALE)
+            c  = m["color"]
+            cv2.line(img,(cx-18,cy),(cx+18,cy),c,2,cv2.LINE_AA)
+            cv2.line(img,(cx,cy-18),(cx,cy+18),c,2,cv2.LINE_AA)
+            cv2.circle(img,(cx,cy),4,c,-1,cv2.LINE_AA)
+            cv2.putText(img,f"M{i+1}",(cx+9,cy-9),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.38,(0,0,0),3,cv2.LINE_AA)
+            cv2.putText(img,f"M{i+1}",(cx+9,cy-9),
+                        cv2.FONT_HERSHEY_SIMPLEX,0.38,c,1,cv2.LINE_AA)
+
+    if frozen:               border_c, bw = C_FROST, 4
+    elif recorder.recording: border_c, bw = C_REC,   3
+    elif flatf.calibrating:  border_c, bw = C_ORANGE, 2
+    elif view_mode == 1:     border_c, bw = (80,138,198), 2
+    else:                    border_c, bw = (20,20,20), 1
+    cv2.rectangle(img,(0,0),(IW-1,IH-1), border_c, bw)
+    return img
+
 # ── Camera finder ─────────────────────────────────────────────────────────────
 
 def find_camera() -> Tuple[Optional[cv2.VideoCapture], Optional[SensorProfile]]:
-    """Open the first thermal camera found and match to a sensor profile."""
+    """Open the first thermal camera found and match to a sensor profile.
+
+    Selects the best OpenCV backend per platform:
+      macOS   — CAP_AVFOUNDATION
+      Windows — CAP_DSHOW
+      Linux   — CAP_V4L2 (also tries default backend as fallback)
+    """
     try_force_60fps()
 
-    for idx in range(8):
-        cap = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
-        if not cap.isOpened(): cap.release(); continue
+    if sys.platform == "darwin":
+        backends = [cv2.CAP_AVFOUNDATION]
+    elif sys.platform == "win32":
+        backends = [cv2.CAP_DSHOW, cv2.CAP_ANY]
+    else:  # Linux and others
+        backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
 
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        ret, frame = cap.read()
-        if not ret or frame is None: cap.release(); continue
+    for backend in backends:
+        for idx in range(12):
+            try:
+                cap = cv2.VideoCapture(idx, backend)
+            except Exception:
+                continue
+            if not cap.isOpened():
+                cap.release(); continue
 
-        h, w = frame.shape[:2]
-        s    = match_sensor(w, h)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                cap.release(); continue
 
-        # Apply optimal format settings
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'I420'))
-        cap.set(cv2.CAP_PROP_FPS, s.fps)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            h, w = frame.shape[:2]
+            s    = match_sensor(w, h)
 
-        actual_fps = cap.get(cv2.CAP_PROP_FPS)
-        print(f"  Camera {idx}: {s.name}  {w}×{h}  {actual_fps:.0f} fps")
-        return cap, s
+            # Skip obvious built-in webcams (high-res, common laptop sizes).
+            # Thermal sensors are always <= 640 × 512.
+            if w > 1280 or h > 1024:
+                cap.release(); continue
+
+            # Apply optimal format / fps settings (best-effort — may be ignored)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'I420'))
+            cap.set(cv2.CAP_PROP_FPS, s.fps)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            print(f"  Camera {idx}: {s.name}  {w}x{h}  {actual_fps:.0f} fps  "
+                  f"(backend {'AVFOUNDATION' if backend==cv2.CAP_AVFOUNDATION else 'DSHOW' if backend==cv2.CAP_DSHOW else 'V4L2' if backend==cv2.CAP_V4L2 else 'default'})")
+            return cap, s
 
     return None, None
 
 # ── Main ──────────────────────────────────────────────────────────────────────
-fps_current = 30.0   # updated every second, used by recorder
+fps_current = 30.0   # updated every second for UI / profiler
+_ESC_KEY_CODES = {27, 0x10001B, 0xFF1B}
+
+def _read_ui_key(delay_ms: int = 1) -> Tuple[int, int]:
+    """Return (raw_key, normalized_key) from OpenCV HighGUI.
+
+    macOS / Qt backends sometimes return backend-specific escape codes such as
+    0x10001B or 0xFF1B instead of plain 27.  Normalize those to 27 while
+    keeping the low ASCII byte for regular keys.
+    """
+    raw = cv2.waitKeyEx(delay_ms) if hasattr(cv2, "waitKeyEx") else cv2.waitKey(delay_ms)
+    if raw < 0:
+        return raw, -1
+    key = raw & 0xFF
+    if raw in _ESC_KEY_CODES or key == 27:
+        return raw, 27
+    return raw, key
 
 def main():
     global norm8, raw_f, frame_stats, status_msg, nuc_auto_t
     global frozen, view_mode, flip_h, flip_v, cm_idx, fps_current
     global cam_fps, _sb_tick, _sb_cache, _pn, _pt
+    global _tc_nuc_offset, _tc_prev_frame, _tc_out_buf
 
     print("Thermal Viewer — searching for camera…")
     cap, s = find_camera()
     if cap is None:
-        print("ERROR: no thermal camera found.\n"
-              "Check System Settings → Privacy → Camera → Terminal"); return
+        hint = {
+            "darwin":  "macOS: System Settings → Privacy & Security → Camera → grant Terminal",
+            "win32":   "Windows: make sure the camera is not in use by another app",
+        }.get(sys.platform, "Linux: check 'ls /dev/video*' and camera permissions")
+        print(f"ERROR: no thermal camera found.\n{hint}"); return
 
     setup_layout(s)
     flatf.load_if_needed()
@@ -924,15 +2362,18 @@ def main():
     grabber = FrameGrabber(cap)
 
     cv2.namedWindow(WIN_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(WIN_NAME, WIN_W, WIN_H)
+    try:
+        cv2.setWindowProperty(WIN_NAME, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    except Exception:
+        cv2.resizeWindow(WIN_NAME, WIN_W, WIN_H)
     cv2.setMouseCallback(WIN_NAME, mouse_cb)
 
     fps_t = time.time(); fps_n = 0
     last_img = np.zeros((IH,IW,3), np.uint8)
 
     print(f"  Window: {WIN_W}x{WIN_H}  (PROFILE={'ON' if PROFILE else 'OFF — set PROFILE=True for stage timing'})")
-    print("  SPACE=freeze  R=record  C=colormap  D=NUC  F=calibrate")
-    print("  T=smooth  H/V=flip  N=view  S=save  Q=quit")
+    print("  SPACE=freeze  R=record  C=colormap  D=NUC  F=colour-cal  Shift+F=full-cal")
+    print("  T=smooth  H/V=flip  N=view  S=save  A=audio input  Q=quit")
     print("  Sidebar buttons are clickable with mouse")
     if PROFILE:
         print("  Profiler: proc / sidebar / compose / show / key  [ms avg]")
@@ -941,43 +2382,100 @@ def main():
         if cv2.getWindowProperty(WIN_NAME, cv2.WND_PROP_VISIBLE) < 1: break
 
         now = time.time()
-        ret, frame = grabber.read()
         cam_fps = grabber.cam_fps          # camera delivery rate from background thread
+        if frozen:
+            pending_frames = grabber.read_all()   # discard while frozen; resume stays current
+        elif recorder.recording:
+            pending_frames = grabber.read_all()   # preserve sensor cadence for recording
+        else:
+            ret, frame, frame_t = grabber.read_latest()
+            pending_frames = [(frame_t, frame)] if ret and frame is not None else []
 
         # ── Frame processing ───────────────────────────────────────────────
         _prof_start()
-        if not frozen and ret and frame is not None:
-            gray = cv2.cvtColor(frame,cv2.COLOR_BGR2GRAY) if frame.ndim==3 else frame
-            f32  = gray.astype(np.float32)
-            raw_f = f32.copy()
+        if not frozen:
+            n_pending = len(pending_frames)
+            for i, (frame_t, frame) in enumerate(pending_frames):
+                if frame is None:
+                    continue
+                is_last = (i == n_pending - 1)
+                gray = frame[:, :, 0] if frame.ndim == 3 else frame
 
-            if flatf.calibrating:
-                done = flatf.feed(f32)
-                if done:
-                    nuc_auto_t = now + 1.0
-                    _action_set_view(1)
-                    status_msg = (f"Flat-field done - {flatf.n_bad} bad px "
-                                  f"- showing NUC Map")
+                if flatf.calibrating:
+                    # f32 required only for calibration feed — don't compute it otherwise
+                    f32 = gray.astype(np.float32)
+                    done = flatf.feed(f32)
+                    if done:
+                        nuc_auto_t = now + 1.0
+                        _action_set_view(1)
+                        status_msg = (f"Flat-field done - {flatf.n_bad} bad px "
+                                      f"- showing NUC Map")
+                else:
+                    # Runtime dead-pixel discovery (skipped during calibration so
+                    # the uniform-surface frames don't pollute the suspicion map).
+                    _rtbp_update(gray)
 
-            if denoise:
-                f32 = flatf.apply(f32)
-                f32 = nuc.update(f32)
-            else:
-                nuc.prev = f32.copy()
+                # ── Fast path: Rust handles NUC + normalize + LUT ──────────────
+                if _HAS_TC and denoise and view_mode == 0 and cm_idx == 0:
+                    n = CAM_W * CAM_H
+                    if _tc_nuc_offset is None or _tc_nuc_offset.shape[0] != n:
+                        _tc_nuc_offset = np.zeros(n, np.float32)
+                        _tc_prev_frame = np.zeros(n, np.float32)
+                        nuc.O    = None
+                        nuc.prev = None
+                    # Allocate persistent output buffer lazily (once, reused every frame)
+                    if _tc_out_buf is None or _tc_out_buf.shape[0] != IH * IW * 3:
+                        _tc_out_buf = np.empty(IH * IW * 3, np.uint8)
+                    # gray_flat: frame[:,:,0] has stride 3 → ravel() makes a contiguous copy
+                    gray_flat = gray.ravel()   # 1-D uint8, already contiguous after ravel
+                    # corr_flat / bad_flat are pre-built on FlatFieldNUC — never recomputed here
+                    _tc.process_frame(
+                        gray_flat, CAM_W, CAM_H,
+                        _tc_nuc_offset, _tc_prev_frame,
+                        nuc.mu, nuc.thresh,
+                        IRON_LUT_FLAT,
+                        _tc_out_buf,           # Rust writes directly into this buffer
+                        IW, IH,
+                        flatf.corr_flat, flatf.bad_flat,
+                    )
+                    # View into _tc_out_buf — no copy.  If we need to draw on it we
+                    # copy lazily below (only when markers are present).
+                    last_img = _tc_out_buf.reshape(IH, IW, 3)
+                    if is_last:
+                        # norm8 at display resolution: used for marker lookups
+                        # and stats.  Its values track temperature via Iron.
+                        norm8 = cv2.cvtColor(last_img, cv2.COLOR_BGR2GRAY)
+                        mn_v, mx_v, _, _ = cv2.minMaxLoc(norm8[::4, ::4])
+                        me_v = float(cv2.mean(norm8[::4, ::4])[0])
+                        frame_stats = {"min": mn_v / 2.55, "max": mx_v / 2.55,
+                                       "mean": me_v / 2.55,
+                                       "delta": (mx_v - mn_v) / 2.55}
 
-            f32   = smoother.update(f32)
-            norm8 = cv2.normalize(f32,None,0,255,cv2.NORM_MINMAX,cv2.CV_8U)
+                # ── Fallback: pure Python (other colormaps / views / no Rust) ──
+                else:
+                    f32   = gray.astype(np.float32)
+                    raw_f = f32.copy()
+                    if denoise:
+                        f32 = flatf.apply(f32)
+                        f32 = nuc.update(f32)
+                    else:
+                        nuc.prev = f32.copy()
+                    f32 = smoother.update(f32)
+                    if is_last:
+                        norm8 = cv2.normalize(f32, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
+                        mn = float(norm8.min()) / 255 * 100
+                        mx = float(norm8.max()) / 255 * 100
+                        me = float(norm8.mean()) / 255 * 100
+                        frame_stats = {"min": mn, "max": mx, "mean": me, "delta": mx - mn}
+                    last_img = build_cam_image(f32, raw_f)
 
-            # Compute min/max/mean in a single pass via numpy reduction
-            mn = float(norm8.min())/255*100
-            mx = float(norm8.max())/255*100
-            me = float(norm8.mean())/255*100
-            frame_stats = {"min":mn,"max":mx,"mean":me,"delta":mx-mn}
-
-            last_img = build_cam_image(f32, raw_f)
-            if flip_h: last_img = cv2.flip(last_img,1)
-            if flip_v: last_img = cv2.flip(last_img,0)
-            fps_n += 1
+                if flip_h: last_img = cv2.flip(last_img, 1)
+                if flip_v: last_img = cv2.flip(last_img, 0)
+                if recorder.recording:
+                    recorder.write(decorate_camera_image(last_img, copy_frame=True),
+                                   copy_frame=False,
+                                   frame_time=frame_t)
+                fps_n += 1
         _prof_tick(0)    # slot 0: frame processing
 
         # Auto-revert NUC map view
@@ -990,31 +2488,7 @@ def main():
             fps_current = fps_n/(now-fps_t); fps_n=0; fps_t=now
 
         # ── Compose display ────────────────────────────────────────────────
-        need_draw = bool(markers) and view_mode != 1 and norm8 is not None
-        img = last_img.copy() if need_draw else last_img
-
-        if need_draw:
-            for i, m in enumerate(markers):
-                cx = int((CAM_W-1-m["x"] if flip_h else m["x"])*SCALE)
-                cy = int((CAM_H-1-m["y"] if flip_v else m["y"])*SCALE)
-                c  = m["color"]
-                cv2.line(img,(cx-18,cy),(cx+18,cy),c,2,cv2.LINE_AA)
-                cv2.line(img,(cx,cy-18),(cx,cy+18),c,2,cv2.LINE_AA)
-                cv2.circle(img,(cx,cy),4,c,-1,cv2.LINE_AA)
-                cv2.putText(img,f"M{i+1}",(cx+9,cy-9),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.38,(0,0,0),3,cv2.LINE_AA)
-                cv2.putText(img,f"M{i+1}",(cx+9,cy-9),
-                            cv2.FONT_HERSHEY_SIMPLEX,0.38,c,1,cv2.LINE_AA)
-
-        if frozen:             border_c, bw = C_FROST, 4
-        elif recorder.recording: border_c, bw = C_REC,   3
-        elif flatf.calibrating: border_c, bw = C_ORANGE, 2
-        elif view_mode == 1:    border_c, bw = (80,138,198), 2
-        else:                   border_c, bw = (20,20,20), 1
-        cv2.rectangle(img,(0,0),(IW-1,IH-1), border_c, bw)
-
-        if recorder.recording:
-            recorder.write(img)
+        img = decorate_camera_image(last_img)
 
         # ── Sidebar — rebuilt at most every _SB_EVERY frames (~20fps) ────
         # Positions never change frame-to-frame so cached hitboxes stay valid.
@@ -1035,11 +2509,12 @@ def main():
             put(_canvas, "FROZEN - SPACE to resume", 80, IH+21, C_FROST, 0.38)
         elif flatf.calibrating:
             put(_canvas, f"Calibrating  {int(flatf.progress*100)}%  "
-                        f"({flatf.frames_captured}/{flatf.N}) - hold still",
+                        f"({flatf.frames_captured}/{flatf.N}) — slowly slide over surface",
                80, IH+21, C_ORANGE, 0.38)
         elif recorder.recording:
             cv2.rectangle(_canvas, (82, IH+12), (90, IH+20), C_REC, -1)
-            put(_canvas, f"RECORDING  {recorder.elapsed:.0f}s", 96, IH+21, C_REC, 0.38)
+            audio_tag2 = " + MIC" if recorder.has_audio else ""
+            put(_canvas, f"RECORDING{audio_tag2}  {recorder.elapsed:.0f}s", 96, IH+21, C_REC, 0.38)
         else:
             put(_canvas, status_msg, 80, IH+21, (148,148,148), 0.36)
         _prof_tick(2)    # slot 2: canvas compose + status bar
@@ -1048,15 +2523,11 @@ def main():
         cv2.imshow(WIN_NAME, _canvas)
         _prof_tick(3)    # slot 3: imshow
 
-        # On macOS, pollKey() still syncs to the 60Hz VSync barrier (~14ms).
-        # Calling it every 6 frames amortises that cost to ~2ms/frame, letting
-        # the loop run faster than camera delivery and match 60fps.
-        # imshow() renders through Core Animation asynchronously, so every
-        # frame pushed to it appears at the next VSync regardless of pollKey.
-        if _sb_tick % 6 == 0:
-            key = cv2.pollKey() & 0xFF
-        else:
-            key = 0xFF
+        # waitKeyEx(1) every frame: macOS Core Animation only commits imshow()
+        # frames to the screen when the Cocoa event loop is drained.  Using
+        # waitKeyEx keeps backend-specific escape codes intact so we can
+        # normalize them reliably instead of hoping they survive masking.
+        raw_key, key = _read_ui_key(1)
         _prof_tick(4)    # slot 4: key poll
 
         # ── Profiler output every 2 s ─────────────────────────────────────
@@ -1072,16 +2543,19 @@ def main():
                 _pt = [0.0]*5; _pn = 0
 
         # ── Keyboard ───────────────────────────────────────────────────────
-        if   key in (ord('q'), 27):     break
+        if   key in (ord('q'), ord('Q'), 27): break
         elif key == ord(' '):           _action_freeze()
         elif key == ord('r'):           _action_toggle_record()
+        elif key == ord('m') and _AUDIO_AVAILABLE: _action_toggle_record_audio()
+        elif key in (ord('a'), ord('A')) and _AUDIO_AVAILABLE: _action_cycle_audio_input()
         elif key == ord('c'):           _action_cycle_cmap()
         elif key == ord('n'):           _action_set_view((view_mode+1)%len(VIEW_MODES))
         elif key == ord('h'):           _action_toggle_fliph()
         elif key == ord('v'):           _action_toggle_flipv()
         elif key == ord('d'):           _action_toggle_denoise()
         elif key == ord('t'):           _action_toggle_temporal()
-        elif key == ord('f'):           _action_start_calibrate()
+        elif key == ord('f'):           _action_start_calibrate('offset')
+        elif key == ord('F'):           _action_start_calibrate('full')
         elif key == ord('s'):           _action_save_snapshot()
 
     if recorder.recording: recorder.stop()

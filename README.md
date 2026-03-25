@@ -1,126 +1,218 @@
-# Thermal Viewer
+# thermal-viewer
 
-Open-source Python thermal camera viewer for USB UVC thermal cameras.
-Clean sidebar UI, noise correction, flat-field calibration, video recording.
+A fast, open-source thermal camera viewer for USB UVC thermal cameras.
+Clean sidebar UI, real-time noise correction, flat-field calibration, recording.
+
+**60 fps** on supported hardware via an optional Rust extension (`thermal_core`).
+Falls back to pure-Python (~55 fps) with no setup required.
+
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/ibmua/thermal-viewer
+cd thermal-viewer
+./install.sh          # macOS / Linux
+# or: install.bat     # Windows
+
+python3 thermal_viewer.py
+```
+
+> **macOS:** grant Terminal camera access in System Settings → Privacy & Security → Camera
 
 ---
 
 ## Supported cameras
 
+Auto-detected by resolution — no configuration needed.
+
 | Camera | Resolution | FPS |
 |---|---|---|
-| FLIR Boson 640 | 640 × 512 | 60 |
-| FLIR Boson 320 | 320 × 256 | 60 |
-| FLIR Lepton 3.x (via PureThermal) | 160 × 120 | 9 |
-| InfiRay / Xinfrared | 256 × 192 | 25 |
-| Seek Compact | 320 × 240 | 15 |
-| Generic UVC thermal | various | 30 |
-
-Camera is **auto-detected** by resolution on startup. No configuration needed.
+| FLIR Boson 640 | 640 x 512 | 60 |
+| FLIR Boson 320 | 320 x 256 | 60 |
+| FLIR Lepton 3.x (PureThermal) | 160 x 120 | 9 |
+| InfiRay / Xinfrared T2S+ | 256 x 192 | 25 |
+| Seek Compact | 320 x 240 | 15 |
+| Any UVC thermal camera | various | 30 |
 
 ---
 
 ## Requirements
 
 - Python 3.9+
-- macOS (primary target; Linux/Windows should work with minor changes)
+- `opencv-python >= 4.7`
+- `numpy >= 1.24`
+
+No other Python dependencies. The optional Rust extension needs the Rust
+toolchain only if building from source — pre-built wheels ship for common platforms.
+
+---
+
+## Manual install
 
 ```bash
 pip install opencv-python numpy
-```
 
-On macOS, grant **Terminal** camera access in
-System Settings → Privacy & Security → Camera.
+# Optional: 60fps Rust extension — pick the right wheel for your platform:
+pip install thermal_core/wheels/thermal_core-*-macosx_*_arm64.whl   # Apple Silicon
+pip install thermal_core/wheels/thermal_core-*-macosx_*_x86_64.whl  # Intel Mac
+pip install thermal_core/wheels/thermal_core-*-win_amd64.whl         # Windows
+
+# Or build from source (requires Rust: https://rustup.rs)
+pip install maturin
+cd thermal_core && maturin build --release
+pip install target/wheels/thermal_core-*.whl --force-reinstall
+```
 
 ---
 
-## Usage
-
-```bash
-python3 thermal_viewer.py
-```
-
-### Controls
+## Controls
 
 | Key / Mouse | Action |
 |---|---|
-| **Left-click** image | Place a marker |
-| **Right-click** image | Remove nearest marker |
-| **Click** sidebar buttons | Toggle modes, cycle colormap |
-| **SPACE** | Freeze / unfreeze current frame |
-| **R** | Start / stop video recording |
-| **C** | Cycle colormap (Iron / Inferno / Turbo / Jet / Hot / Gray) |
-| **N** | Cycle view: Live → NUC Map → Raw |
-| **D** | Toggle Motion NUC denoising |
-| **F** | Flat-field calibration (point at uniform surface first) |
-| **T** | Toggle temporal smoothing |
-| **H** | Flip horizontal |
-| **V** | Flip vertical |
-| **S** | Save PNG snapshot |
-| **Q / Esc** | Quit |
+| Left-click image | Place temperature marker |
+| Right-click image | Remove nearest marker |
+| Sidebar buttons | Clickable — freeze, record, save |
+| SPACE | Freeze / unfreeze |
+| R | Start / stop recording |
+| M | Toggle microphone capture for recording |
+| A | Change audio input where supported |
+| C | Cycle colormap (Iron / Inferno / Turbo / Jet / Hot / Gray) |
+| N | Cycle view: Live / NUC Map / Raw |
+| D | Toggle Motion NUC denoising |
+| F | Quick colour calibration / bad-pixel refresh |
+| Shift + F | Full dead-pixel re-detection |
+| T | Toggle temporal smoothing |
+| H / V | Flip horizontal / vertical |
+| S | Save PNG snapshot |
+| Q / Esc | Quit |
 
 ---
 
-## UI layout
+## UI
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  Camera image (clean — no overlays)       │  Sidebar    │
-│                                           │  ─ sensor   │
-│  Only marker crosshairs drawn on image    │  ─ histogram│
-│  (tiny M1, M2 labels)                     │  ─ stats    │
-│                                           │  ─ colormap │
-│                                           │  ─ view mode│
-│                                           │  ─ flat-NUC │
-│                                           │  ─ modes    │
-│                                           │  ─ recording│
-│                                           │  ─ markers  │
-├───────────────────────────────────────────────────────── │
-│  Status bar                                              │
-└─────────────────────────────────────────────────────────┘
++-----------------------------------+--------------+
+|                                   | cam/disp fps |
+|     Thermal image                 | FREEZE | REC |
+|                                   | SAVE         |
+|                                   | LAST SAVE    |
+|     Click to place markers        | distribution |
+|     M1: 42%  M2: 78%              | colormap     |
+|                                   | view mode    |
+|                                   | flat-NUC     |
+|                                   | corrections  |
+|                                   | markers list |
++-----------------------------------+--------------+
+|  [LIVE]  cam 60 / disp 60 fps     status msg    |
++--------------------------------------------------+
 ```
 
-Colormap, scale, mode badges, markers, and controls are all in the **sidebar** — nothing overlaid on the thermal image except small marker labels.
+All controls are in the sidebar — the thermal image stays clean.
 
 ---
 
-## Noise correction pipeline
+## Noise correction
 
-Three independent, stackable corrections:
+Three stackable corrections, all toggleable in real time:
 
-1. **Flat-field NUC** (one-point calibration)
-   Point at any uniform surface → press **F** → hold 2 seconds.
-   Computes per-pixel offset correction and detects stuck/dead pixels.
-   Calibration is saved to `~/.thermal_viewer/flatfield_WxH.npz` and loaded automatically next run.
+**1. Flat-field NUC** (`F`)
+Point at any uniform surface, press F, hold ~2 s.
+Saves per-pixel offsets + dead pixel map to `~/.thermal_viewer/flatfield_WxH.npz`.
+Loaded automatically next run.
 
-2. **Motion-gated NUC** (scene-based, always running in background)
-   Learns the fixed-pattern noise from scene motion using an LMS algorithm.
-   No calibration target needed. Toggle with **D**.
+**2. Motion-gated NUC** (`D`)
+Scene-based LMS — learns fixed-pattern noise from natural scene motion.
+No calibration target needed.
 
-3. **Temporal EMA smoothing**
-   Exponential moving average (α = 0.35) to reduce per-frame random noise (NETD).
-   Toggle with **T**.
-
-### NUC Map view
-
-Press **N** to switch to **NUC Map** — shows the flat-field correction as a colorized heatmap. Bright = pixels that were consistently too bright (corrected down). Dark = pixels too dark (corrected up). Useful for verifying calibration quality.
+**3. Temporal EMA smoothing** (`T`)
+Exponential moving average (α = 0.35) reduces per-frame random noise.
 
 ---
 
-## Video recording
+## Performance
 
-Press **R** to start recording. The colorized camera image is saved as `.mp4` to `~/Desktop/BosonCaptures/`. Press **R** again to stop. File size and duration are printed to the terminal.
+| Mode | FPS | Notes |
+|---|---|---|
+| Pure Python | ~55 | Default — no extra setup |
+| With `thermal_core` (Rust) | **60** | PyO3 + rayon parallel pipeline |
+
+`thermal_core` runs the entire hot-loop in parallel: gray cast → flat-field →
+NUC (box-blur LMS) → normalize → Iron LUT → INTER_NEAREST upscale.
+Falls back silently if not installed.
+
+Set `PROFILE = True` in `thermal_viewer.py` for per-stage millisecond timing.
 
 ---
 
-## Notes on FLIR Boson FPS
+## Recording
 
-The Boson 640 supports 60 fps but USB 2.0 bandwidth limits raw BGRA at that rate. This viewer pre-configures the device via PyObjC (macOS AVFoundation) before OpenCV opens the session, and requests I420 (YUV planar) pixel format which fits in ~28 MB/s. Expect 50–60 fps reported.
+Press `R` to start. Colorized `.mp4` files are saved to `~/Desktop/BosonCaptures/`.
+The app records the video path and microphone path separately, then muxes them
+into the final MP4 when you stop.
 
-If PyObjC is not available the viewer falls back gracefully to whatever rate OpenCV negotiates (typically 30 fps).
+- Press `M` to enable / disable microphone recording before starting.
+- Press `A` to cycle inputs where supported.
+- On macOS the app keeps the display awake while recording so the screen does
+  not auto-sleep / auto-lock from idle.
+- After saving, the sidebar shows a `LAST SAVE` card with clickable `OPEN` and
+  `REVEAL` actions.
+- If the final audio/video mux fails, the video is still preserved and the raw
+  audio sidecar is left on disk next to it for recovery.
+
+> Large recordings need extra free disk space at stop-time, because the final
+> MP4 is written as a new file during muxing.
+
+---
+
+## Window behavior
+
+The app launches fullscreen by default.
+
+---
+
+## Building the Rust extension
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # install Rust
+pip install maturin
+cd thermal_core
+maturin build --release
+pip install target/wheels/thermal_core-*.whl --force-reinstall
+```
+
+---
+
+## Project structure
+
+```
+thermal-viewer/
+  thermal_viewer.py      main application
+  fps_bare.py            FPS benchmark / diagnostic
+  thermal_core/          Rust extension (PyO3 + rayon)
+    src/lib.rs           hot-loop pipeline
+    Cargo.toml
+    wheels/              pre-built wheels
+  requirements.txt
+  install.sh             macOS / Linux installer
+  install.bat            Windows installer
+  assets/                screenshots
+```
+
+---
+
+## Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS Apple Silicon | Primary | Pre-built wheel included |
+| macOS Intel | Supported | Pre-built wheel included |
+| Linux x86_64 | Supported | Build from source; V4L2 backend |
+| Windows x64 | Supported | Build from source; DirectShow backend |
 
 ---
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

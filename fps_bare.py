@@ -21,45 +21,83 @@ DISPLAY_MODE = 3   # 0 = capture-only, 1 = raw, 2 = gray, 3 = colormap+resize
 def try_force_60fps():
     try:
         import AVFoundation as avf, CoreMedia as cm
+        boson_sizes = {(640, 512), (320, 256)}
         for dev in avf.AVCaptureDevice.devicesWithMediaType_(avf.AVMediaTypeVideo):
             name = str(dev.localizedName())
             if "FLIR" not in name and "Boson" not in name: continue
             best = None
+            best_range = None
+            best_rate = 0.0
+            best_area = -1
             for fmt in dev.formats():
                 d = cm.CMVideoFormatDescriptionGetDimensions(fmt.formatDescription())
-                if d.width == 640 and d.height == 512:
-                    for r in fmt.videoSupportedFrameRateRanges():
-                        if r.maxFrameRate() >= 60: best = fmt; break
-                if best: break
-            if not best: return
-            if dev.lockForConfiguration_(None): return
-            dev.setActiveFormat_(best)
-            t = cm.CMTimeMake(1, 60)
-            dev.setActiveVideoMinFrameDuration_(t)
-            dev.setActiveVideoMaxFrameDuration_(t)
-            dev.unlockForConfiguration()
+                dims = (int(d.width), int(d.height))
+                if dims not in boson_sizes:
+                    continue
+                fmt_best_range = None
+                max_rate = 0.0
+                for r in fmt.videoSupportedFrameRateRanges():
+                    rate = float(r.maxFrameRate())
+                    if rate > max_rate:
+                        max_rate = rate
+                        fmt_best_range = r
+                if max_rate < 60.0:
+                    continue
+                area = dims[0] * dims[1]
+                if best is None or (area, max_rate) > (best_area, best_rate):
+                    best = fmt
+                    best_range = fmt_best_range
+                    best_rate = max_rate
+                    best_area = area
+            if best is None:
+                continue
+            locked = dev.lockForConfiguration_(None)
+            if isinstance(locked, tuple):
+                locked = locked[0]
+            if not locked:
+                continue
+            try:
+                dev.setActiveFormat_(best)
+                if best_range is not None:
+                    try:
+                        min_dur = best_range.minFrameDuration()
+                        max_dur = best_range.maxFrameDuration()
+                        dev.setActiveVideoMinFrameDuration_(min_dur)
+                        dev.setActiveVideoMaxFrameDuration_(max_dur)
+                    except Exception:
+                        pass
+            finally:
+                dev.unlockForConfiguration()
             print(f"  PyObjC: 60fps locked on '{name}'")
     except Exception as e:
         print(f"  PyObjC skip: {e}")
 
 try_force_60fps()
 
+# Known thermal sensor resolutions — anything else (webcam, etc.) is skipped
+_THERMAL_SIZES = {(640,512),(320,256),(160,120),(256,192),(320,240)}
+
 cap = None
+print("Scanning cameras:")
 for idx in range(8):
     c = cv2.VideoCapture(idx, cv2.CAP_AVFOUNDATION)
     if not c.isOpened(): c.release(); continue
     c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     ret, f = c.read()
     if not ret or f is None: c.release(); continue
+    h, w = f.shape[:2]
+    is_thermal = (w, h) in _THERMAL_SIZES
+    print(f"  [{idx}] {w}x{h}  {'<-- thermal' if is_thermal else '(skipped)'}")
+    if not is_thermal: c.release(); continue
     c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'I420'))
     c.set(cv2.CAP_PROP_FPS, 60)
     c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    h, w = f.shape[:2]
-    print(f"  Camera {idx}: {w}x{h}  reported={c.get(cv2.CAP_PROP_FPS):.0f}fps")
+    print(f"  Using camera {idx}: {w}x{h}  reported={c.get(cv2.CAP_PROP_FPS):.0f}fps")
     cap = c; break
 
 if cap is None:
-    print("No camera found"); raise SystemExit
+    print("No thermal camera found (is it plugged in? check System Settings -> Camera)")
+    raise SystemExit
 
 # ── Threaded grabber with _new flag ───────────────────────────────────────────
 _frame = None; _new = False; _lock = threading.Lock(); _alive = True
@@ -93,7 +131,8 @@ def _build_iron():
                 lut[i,0]=[int(c0[k]+f*(c1[k]-c0[k])) for k in range(3)]
                 break
     return lut
-IRON = _build_iron()
+IRON      = _build_iron()
+IRON_FLAT = IRON[:, 0, :]   # (256, 3) — for cv2.LUT (faster than numpy fancy indexing)
 
 WIN = "fps_bare"
 if DISPLAY_MODE > 0:
@@ -119,16 +158,25 @@ while True:
 
     if frame is not None:
         if DISPLAY_MODE >= 2:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim==3 else frame
+            # Single-channel slice is faster than cvtColor for a camera that
+            # outputs identical BGR channels (FLIR Boson with I420 format).
+            gray = frame[:, :, 0] if frame.ndim == 3 else frame
         if DISPLAY_MODE >= 3:
-            n8   = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_8U)
-            col  = IRON[n8, 0]                    # Iron LUT
-            disp = cv2.resize(col, (960, 768), interpolation=cv2.INTER_NEAREST)
+            # convertScaleAbs uses SIMD; avoids two-pass NORM_MINMAX overhead.
+            mn = int(gray.min()); mx = int(gray.max())
+            alpha = 255.0 / (mx - mn) if mx > mn else 1.0
+            n8   = cv2.convertScaleAbs(gray, alpha=alpha, beta=-mn * alpha)
+            # IRON_FLAT[n8] is numpy fancy-indexing into a (256,3) table;
+            # equivalent to IRON[n8,0] but avoids the unit-dimension axis.
+            col  = IRON_FLAT[n8]
+            # Don't resize in Python — WINDOW_NORMAL lets Core Animation
+            # GPU-scale the native 640×512 image to the 960×768 window for
+            # free.  Skipping this saves ~1.5ms of proc time.
+            disp = col
         elif DISPLAY_MODE == 2:
-            disp = cv2.resize(gray, (960, 768), interpolation=cv2.INTER_NEAREST)
-            disp = cv2.cvtColor(disp, cv2.COLOR_GRAY2BGR)
+            disp = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
         elif DISPLAY_MODE == 1:
-            disp = cv2.resize(frame, (960, 768), interpolation=cv2.INTER_NEAREST)
+            disp = frame
         disp_n += 1
 
     t_proc_acc += time.perf_counter() - t0
@@ -139,12 +187,14 @@ while True:
         t_show_acc += time.perf_counter() - t1
 
     t2 = time.perf_counter()
-    # Poll every 6 frames — macOS pollKey syncs to VSync (~14ms each call);
-    # amortising to 1-in-6 reduces key cost from 14ms to ~2ms per frame.
-    if disp_n % 6 == 0:
-        key = cv2.pollKey() & 0xFF
-    else:
-        key = 0xFF
+    # waitKey(1) every frame: drains the macOS Cocoa event loop so Core
+    # Animation actually commits each imshow() to screen.  With only 4ms of
+    # processing ahead of it, waitKey syncs to the next VSync boundary
+    # (~16.7ms) for free — we were going to wait for the next camera frame
+    # anyway.  Skipping this (or using pollKey every 6 frames) causes macOS to
+    # buffer imshow calls and only push them to screen every pollKey call,
+    # making the window look like ~10 fps even though disp_n counts 60/s.
+    key = cv2.waitKey(1) & 0xFF
     t_key_acc += time.perf_counter() - t2
 
     now = time.perf_counter()

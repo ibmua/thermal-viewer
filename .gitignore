@@ -2,21 +2,45 @@
 __pycache__/
 *.py[cod]
 *.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
 .venv/
 venv/
 env/
+ENV/
+
+# Rust / Cargo
+thermal_core/target/
+# Cargo.lock is committed for reproducible builds (binary crate)
+
+# Wheels — ignore everywhere EXCEPT the bundled pre-built wheels directory
+*.whl
+!thermal_core/wheels/*.whl
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
 
 # Calibration data (user-specific)
 ~/.thermal_viewer/
 
-# Captures
-BosonCaptures/
-
-# macOS
-.DS_Store
-*.DS_Store
-
-# Editor
+# IDE
 .vscode/
 .idea/
 *.swp
+
+# Recordings
+*.mp4
+*.mov
+*.m4a
+*.wav
+thermal_*.png
+boson_*.png
+audio_mode_samples_*/
