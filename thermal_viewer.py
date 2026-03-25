@@ -539,7 +539,7 @@ class VideoRecorder:
     back to video-only if no usable audio backend is available.
 
     Platform audio input:
-      macOS   — CoreAudio via sounddevice (preferred), ffmpeg fallback
+      macOS   — AVAudioRecorder (preferred), sounddevice fallback, ffmpeg fallback
       Linux   — PulseAudio    (-f pulse -i default)
       Windows — DirectShow    (-f dshow -i audio=default)
     """

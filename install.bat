@@ -11,14 +11,14 @@ echo === thermal-viewer installer ===
 echo.
 
 REM ── 1. Python deps ─────────────────────────────────────────────────────────
-echo Installing Python dependencies...
+echo Installing Python package and dependencies...
 python -m pip install --upgrade pip --quiet
-python -m pip install numpy "opencv-python>=4.7" --quiet
+python -m pip install . --quiet
 if errorlevel 1 (
-    echo ERROR: pip install failed. Is Python 3.9+ installed and on PATH?
+    echo ERROR: package install failed. Is Python 3.9+ installed and on PATH?
     exit /b 1
 )
-echo   opencv-python + numpy OK
+echo   thermal-viewer + Python dependencies OK
 
 REM ── 2. Detect Python tag ───────────────────────────────────────────────────
 for /f "delims=" %%i in ('python -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')"') do set PY_TAG=%%i
@@ -74,6 +74,22 @@ if %INSTALLED_TC%==0 (
 )
 
 echo.
+where ffmpeg >nul 2>&1
+if errorlevel 1 (
+    echo   WARNING: ffmpeg not found -- video recording works, but microphone audio
+    echo            cannot be finalized into the saved MP4 until ffmpeg is installed.
+) else (
+    echo   ffmpeg OK -- microphone recording can be muxed into MP4
+)
+
+echo.
 echo === Install complete ===
 echo Run with: python thermal_viewer.py
+where thermal-viewer >nul 2>&1
+if errorlevel 1 (
+    for /f "delims=" %%i in ('python -c "import site; print(site.USER_BASE + r'\\Scripts\\thermal-viewer.exe')"' ) do set TV_SCRIPT=%%i
+    echo Console script installed at: !TV_SCRIPT!
+) else (
+    echo      or: thermal-viewer
+)
 endlocal

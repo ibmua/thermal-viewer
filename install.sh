@@ -9,10 +9,10 @@ GITHUB_RELEASE_URL="https://github.com/${REPO}/releases/latest/download"
 echo "=== thermal-viewer installer ==="
 
 # ── 1. Python deps ─────────────────────────────────────────────────────────────
-echo "Installing Python dependencies..."
+echo "Installing Python package and dependencies..."
 python3 -m pip install --upgrade pip --quiet
-python3 -m pip install numpy "opencv-python>=4.7" --quiet
-echo "  opencv-python + numpy OK"
+python3 -m pip install . --quiet
+echo "  thermal-viewer + Python dependencies OK"
 
 # ── 2. Identify the right wheel ────────────────────────────────────────────────
 WHEEL_DIR="thermal_core/wheels"
@@ -105,11 +105,26 @@ if [ "$INSTALLED_TC" -eq 0 ]; then
 fi
 
 echo ""
+if command -v ffmpeg &>/dev/null; then
+    echo "  ffmpeg OK — microphone recording can be muxed into MP4"
+else
+    echo "  ⚠  ffmpeg not found — video recording works, but microphone audio"
+    echo "     cannot be finalized into the saved MP4 until ffmpeg is installed."
+fi
+
+echo ""
 echo "=== Install complete ==="
 echo ""
 if [ "$(uname -s)" = "Darwin" ]; then
     echo "macOS: if the camera doesn't open, grant Terminal camera access:"
     echo "  System Settings → Privacy & Security → Camera"
+    echo "macOS: for microphone recording, also grant Terminal microphone access."
     echo ""
 fi
 echo "Run with:  python3 thermal_viewer.py"
+if command -v thermal-viewer &>/dev/null; then
+    echo "      or:  thermal-viewer"
+else
+    USER_BIN=$(python3 -c "import site; print(site.USER_BASE + '/bin')")
+    echo "Console script installed at:  $USER_BIN/thermal-viewer"
+fi

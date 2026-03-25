@@ -25,6 +25,11 @@ python3 thermal_viewer.py
 ```
 
 > **macOS:** grant Terminal camera access in System Settings → Privacy & Security → Camera
+>
+> **Microphone recording:** install `ffmpeg` and grant Terminal microphone access.
+>
+> The packaged `thermal-viewer` console script is also installed, but on some
+> systems the user scripts directory is not on `PATH` by default.
 
 ---
 
@@ -48,21 +53,30 @@ Auto-detected by resolution — no configuration needed.
 - Python 3.9+
 - `opencv-python >= 4.7`
 - `numpy >= 1.24`
+- `ffmpeg` if you want microphone audio in the saved MP4
 
-No other Python dependencies. The optional Rust extension needs the Rust
-toolchain only if building from source — pre-built wheels ship for common platforms.
+No extra Python dependencies are needed for video-only use. On macOS,
+`install.sh` / `pip install .` also install the native audio helper packages
+(`pyobjc 11.x` and `sounddevice`) used for microphone capture.
+The optional Rust extension needs the Rust toolchain only if building from
+source.
 
 ---
 
 ## Manual install
 
 ```bash
-pip install opencv-python numpy
+pip install .
 
-# Optional: 60fps Rust extension — pick the right wheel for your platform:
-pip install thermal_core/wheels/thermal_core-*-macosx_*_arm64.whl   # Apple Silicon
-pip install thermal_core/wheels/thermal_core-*-macosx_*_x86_64.whl  # Intel Mac
-pip install thermal_core/wheels/thermal_core-*-win_amd64.whl         # Windows
+# Optional: microphone audio in saved MP4 files
+# macOS:   brew install ffmpeg
+# Ubuntu:  sudo apt install ffmpeg
+# Windows: install ffmpeg and put it on PATH
+
+# Optional: 60fps Rust extension
+# The repo currently bundles the Apple Silicon wheel locally.
+pip install thermal_core/wheels/thermal_core-*-macosx_*_arm64.whl
+# Other platforms can use a GitHub Release wheel if present, or build from source.
 
 # Or build from source (requires Rust: https://rustup.rs)
 pip install maturin
@@ -159,6 +173,7 @@ into the final MP4 when you stop.
 
 - Press `M` to enable / disable microphone recording before starting.
 - Press `A` to cycle inputs where supported.
+- `ffmpeg` must be available on `PATH` for microphone audio to end up in the final MP4.
 - On macOS the app keeps the display awake while recording so the screen does
   not auto-sleep / auto-lock from idle.
 - After saving, the sidebar shows a `LAST SAVE` card with clickable `OPEN` and
@@ -191,12 +206,19 @@ pip install target/wheels/thermal_core-*.whl --force-reinstall
 
 ---
 
+## Release checklist
+
+For release validation and publishing steps, see [RELEASE.md](/Users/sharpy/thermal-viewer/RELEASE.md).
+
+---
+
 ## Project structure
 
 ```
 thermal-viewer/
   thermal_viewer.py      main application
   fps_bare.py            FPS benchmark / diagnostic
+  setup.py               packaging shim for older pip/setuptools stacks
   thermal_core/          Rust extension (PyO3 + rayon)
     src/lib.rs           hot-loop pipeline
     Cargo.toml
@@ -213,10 +235,10 @@ thermal-viewer/
 
 | Platform | Status | Notes |
 |---|---|---|
-| macOS Apple Silicon | Primary | Pre-built wheel included |
-| macOS Intel | Supported | Pre-built wheel included |
-| Linux x86_64 | Supported | Build from source; V4L2 backend |
-| Windows x64 | Supported | Build from source; DirectShow backend |
+| macOS Apple Silicon | Primary | Bundled wheel included in repo |
+| macOS Intel | Supported | Source build today; release wheels can be attached to GitHub Releases |
+| Linux x86_64 | Supported | Source build today; V4L2 backend |
+| Windows x64 | Supported | Source build today; DirectShow backend |
 
 ---
 

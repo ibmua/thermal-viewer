@@ -18,6 +18,13 @@ setup(
     install_requires=[
         "opencv-python>=4.7",
         "numpy>=1.24",
+        "sounddevice>=0.5; platform_system == 'Darwin'",
+        "pyobjc-core>=11.1,<12; platform_system == 'Darwin'",
+        "pyobjc-framework-AVFoundation>=11.1,<12; platform_system == 'Darwin'",
+        "pyobjc-framework-Cocoa>=11.1,<12; platform_system == 'Darwin'",
+        "pyobjc-framework-CoreAudio>=11.1,<12; platform_system == 'Darwin'",
+        "pyobjc-framework-CoreMedia>=11.1,<12; platform_system == 'Darwin'",
+        "pyobjc-framework-Quartz>=11.1,<12; platform_system == 'Darwin'",
     ],
     entry_points={
         "console_scripts": [

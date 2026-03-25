@@ -10,7 +10,7 @@ Thank you for considering contributing! Here's everything you need to get starte
 git clone https://github.com/ibmua/thermal-viewer
 cd thermal-viewer
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install numpy opencv-python
+pip install -e .
 
 # Build the Rust extension in development mode (requires Rust ≥ 1.75)
 cd thermal_core && maturin develop --release && cd ..
@@ -85,11 +85,7 @@ Edit `find_camera()` in `thermal_viewer.py`:
 
 ## Releasing a new version
 
-1. Update `version` in `pyproject.toml` and `thermal_core/Cargo.toml`.
-2. Commit: `git commit -am "chore: bump version to X.Y.Z"`
-3. Tag: `git tag vX.Y.Z && git push origin vX.Y.Z`
-4. The `build-wheels.yml` workflow builds wheels for all platforms and creates a GitHub Release automatically.
-5. Copy the release wheels into `thermal_core/wheels/` and commit so `install.sh` can find them.
+See [RELEASE.md](/Users/sharpy/thermal-viewer/RELEASE.md) for the full release checklist, automated validation commands, and the manual hardware sanity checks that still need to be done on a real camera before tagging.
 
 ---
 
